@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Set version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -22,12 +26,13 @@ jobs:
       - name: Display tag
         run: |
           echo "TAG=${GITHUB_REF_NAME}"
+          echo "VERSION=${{ steps.ver.outputs.version }}"
           echo "SHA=${GITHUB_SHA}"
 
       - name: Build project zip
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           ZIP_NAME="mindmap-editor-${VERSION}.zip"
 
           zip -r "${ZIP_NAME}" \
@@ -42,6 +47,13 @@ jobs:
           echo "ZIPPED:"
           unzip -l "${ZIP_NAME}"
 
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          sha256sum mindmap-editor-*.zip > SHA256SUMS.txt
+          echo "--- SHA256SUMS.txt ---"
+          cat SHA256SUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -53,20 +65,22 @@ jobs:
           body: |
             ## 📦 包含
 
-            本次发布包含 **三个产物**：
+            本次发布包含 **四个产物**：
 
             | 产物 | 说明 |
             | --- | --- |
             | `Source code (zip)` | 完整源码（含 `.github/workflows`），GitHub 自动生成 |
             | `Source code (tar.gz)` | 完整源码的 tar.gz 包，GitHub 自动生成 |
-            | `mindmap-editor-1.0.0.zip` | **项目运行包**：只含 `index.html`、`css/`、`js/`、`README.md`、`LICENSE`、`CHANGELOG.md`，解压后双击 `index.html` 即可，**无需任何构建或服务器** |
+            | `mindmap-editor-${{ steps.ver.outputs.version }}.zip` | **项目运行包**：只含 `index.html`、`css/`、`js/`、`README.md`、`LICENSE`、`CHANGELOG.md`，解压后双击 `index.html` 即可，**无需任何构建或服务器** |
+            | `SHA256SUMS.txt` | 下载完整性校验：对 `mindmap-editor-${{ steps.ver.outputs.version }}.zip` 的 SHA-256 哈希 |
 
             ## 🚀 使用
 
-            1. 在下方 *Assets* 区下载 `mindmap-editor-1.0.0.zip`
-            2. 解压到任意目录
-            3. **双击 `index.html`** 在浏览器中打开
-            4. 数据自动保存在浏览器 `localStorage` 中
+            1. 在下方 *Assets* 区下载 `mindmap-editor-${{ steps.ver.outputs.version }}.zip` 与 `SHA256SUMS.txt`
+            2. （可选）执行 `sha256sum -c SHA256SUMS.txt` 校验完整性
+            3. 解压到任意目录
+            4. **双击 `index.html`** 在浏览器中打开
+            5. 数据自动保存在浏览器 `localStorage` 中
 
             > 推荐使用 **Chrome / Edge / Firefox** 最新版。
 
@@ -80,12 +94,12 @@ jobs:
             - 缩略图、大纲、节点折叠 / 展开
             - 工作流连线（DAG 约束）
 
-            完整功能与快捷键见 [`README.md`](https://github.com/elaysia-feng/mindmap-editor/blob/v1.0.0/README.md)。
+            完整功能与快捷键见 [`README.md`](https://github.com/elaysia-feng/mindmap-editor/blob/${{ github.ref_name }}/README.md)。
 
             ## 🔗 演示
 
             <!--
-              当前（v1.0.0）**未启用** GitHub Pages。
+              当前（${{ github.ref_name }}）**未启用** GitHub Pages。
               如后续要启用：
               1) Settings → Pages → Source 选 `main` 分支的 `/` 根目录
               2) 发布完成后删除本注释块，并在此处填入实际 Pages URL
@@ -95,8 +109,9 @@ jobs:
 
             ## 🪪 许可
 
-            本项目以 **MIT License** 发布，详见 [`LICENSE`](https://github.com/elaysia-feng/mindmap-editor/blob/v1.0.0/LICENSE)。
+            本项目以 **MIT License** 发布，详见 [`LICENSE`](https://github.com/elaysia-feng/mindmap-editor/blob/${{ github.ref_name }}/LICENSE)。
           files: |
-            mindmap-editor-1.0.0.zip
+            mindmap-editor-${{ steps.ver.outputs.version }}.zip
+            SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
