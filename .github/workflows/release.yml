@@ -3,7 +3,12 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*'
+
+# 防止并发推 tag 时双发布；同一 tag 的重跑不被取消
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -50,7 +55,8 @@ jobs:
       - name: Generate SHA256SUMS
         shell: bash
         run: |
-          sha256sum mindmap-editor-*.zip > SHA256SUMS.txt
+          VERSION="${{ steps.ver.outputs.version }}"
+          sha256sum "mindmap-editor-${VERSION}.zip" > SHA256SUMS.txt
           echo "--- SHA256SUMS.txt ---"
           cat SHA256SUMS.txt
 
@@ -60,7 +66,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "MindMap Studio ${{ github.ref_name }}"
           draft: false
-          prerelease: false
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
           generate_release_notes: true
           body: |
             ## 📦 包含
