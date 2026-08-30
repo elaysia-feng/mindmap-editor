@@ -1,0 +1,32 @@
+# OMC 运行时状态
+.omc/
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时 / 产物
+*.zip
+*.tar.gz
+*.tgz
+node_modules/
+dist/
+build/
+*.log
+*.tmp
+*.bak
+
+# 凭据
+.env
+.env.*
+*.pem
