@@ -9,7 +9,12 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => root.querySelectorAll(sel);
 const uid = () => 'n' + Math.random().toString(36).slice(2, 10);
+// 可以安全地拼进 CSS 属性选择器的 id 形状。
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const isEditableTarget = (target) => Boolean(
+  target?.closest?.('input, textarea, select, [contenteditable="true"]')
+);
 
 function setSourceLine(node, line) {
   Object.defineProperty(node, '__sourceLine', {
@@ -35,6 +40,7 @@ class MindMap {
     this.root = root || this.createDefault();
     this.links = Array.isArray(links) ? links : [];
     this.nodes = new Map();
+    this.parents = new Map();
     this.collapsedCache = new Set();
     this.rebuildIndex();
   }
@@ -52,16 +58,29 @@ class MindMap {
 
   rebuildIndex() {
     this.nodes.clear();
-    const walk = (n) => {
+    this.parents.clear();
+    // 导入的 JSON 可能带有重复 id，或含有引号/括号——后者会让 `[data-id="…"]`
+    // 选择器抛 SyntaxError。统一换成安全 id，并把连线一起改写过去。
+    const remapped = new Map();
+    const walk = (n, parent = null) => {
+      const originalId = n.id;
+      if (typeof n.id !== 'string' || !SAFE_ID.test(n.id) || this.nodes.has(n.id)) {
+        const safe = uid();
+        if (originalId !== undefined && originalId !== null && !remapped.has(originalId)) {
+          remapped.set(originalId, safe);
+        }
+        n.id = safe;
+      }
       this.nodes.set(n.id, n);
-      n.children.forEach(walk);
+      if (parent) this.parents.set(n.id, parent);
+      n.children.forEach((child) => walk(child, n));
     };
     walk(this.root);
     const normalizedLinks = [];
     const seenLinks = new Set();
     (Array.isArray(this.links) ? this.links : []).forEach((link) => {
-      const from = link?.from;
-      const to = link?.to;
+      const from = remapped.get(link?.from) || link?.from;
+      const to = remapped.get(link?.to) || link?.to;
       if (!from || !to || from === to || !this.nodes.has(from) || !this.nodes.has(to)) return;
       const key = `${from}->${to}`;
       if (seenLinks.has(key)) return;
@@ -186,9 +205,16 @@ class MindMap {
 
   findParent(node) {
     if (node === this.root) return null;
+    // 缓存命中前先校验：树结构可能在 rebuildIndex 之前被直接改过。
+    const cached = this.parents.get(node.id);
+    if (cached && cached.children.includes(node)) return cached;
     for (const n of this.nodes.values()) {
-      if (n.children.includes(node)) return n;
+      if (n.children.includes(node)) {
+        this.parents.set(node.id, n);
+        return n;
+      }
     }
+    this.parents.delete(node.id);
     return null;
   }
 
@@ -255,7 +281,8 @@ class MindMap {
       } else if (level <= 4) {
         lines.push(`${'#'.repeat(level + 1)} ${text}`);
       } else {
-        lines.push(`${'  '.repeat(level - 1)}- ${text}`);
+        // 第一层列表必须顶格：缩进 4 个空格以上会被标准 Markdown 当成代码块。
+        lines.push(`${'  '.repeat(level - 5)}- ${text}`);
       }
       node.children.forEach((c) => walk(c, level + 1));
     };
@@ -617,11 +644,16 @@ function findParentOf(root, node) {
 function computeBounds(root) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   const walk = (n) => {
-    minX = Math.min(minX, n.x);
-    maxX = Math.max(maxX, n.x);
-    minY = Math.min(minY, n.y);
-    maxY = Math.max(maxY, n.y);
-    n.children.forEach(walk);
+    if (!n || typeof n !== 'object') return;
+    const x = Number.isFinite(Number(n.x)) ? Number(n.x) : 0;
+    const y = Number.isFinite(Number(n.y)) ? Number(n.y) : 0;
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+    // 折叠节点本身仍可见，但它的子树不参与画布、缩略图和适应视图的边界。
+    if (n.collapsed) return;
+    (Array.isArray(n.children) ? n.children : []).forEach(walk);
   };
   walk(root);
   if (minX === Infinity) {
@@ -686,10 +718,12 @@ const viewport = {
     const b = computeBounds(map.root);
     if (b.width === 0 && b.height === 0) {
       const rect = getCanvasRect();
-      this.x = rect.width / 2;
-      this.y = rect.height / 2;
       this.scale = 1;
+      this.x = rect.width / 2 - b.centerX * this.scale;
+      this.y = rect.height / 2 - b.centerY * this.scale;
       this.apply();
+      updateStatus();
+      renderMinimap();
       return;
     }
     const rect = getCanvasRect();
@@ -722,6 +756,8 @@ let selectedId = null;
 let selectedLinkId = null;
 let editing = false;
 let spaceHeld = false;
+// Space 按住期间是否真的平移过（用来区分「折叠快捷键」和「平移修饰键」）
+let spacePanned = false;
 let activeMode = 'map';
 let markdownText = '';
 let markdownLastValidText = '';
@@ -739,6 +775,9 @@ const redoStack = [];
 
 // 新建节点动画标记（renderNodes 消费一次后清空）
 window.__pendingNewNodeId = null;
+
+// 节点 id -> DOM 元素，renderNodes 重建；避免连线渲染时逐条全量扫描 DOM。
+const nodeElements = new Map();
 
 // 拖拽节点
 let draggingNode = null;
@@ -825,6 +864,10 @@ function finishMapChange(label, before, options = {}) {
   return changed;
 }
 
+function commitActiveEdit() {
+  if (activeEditCommit) activeEditCommit();
+}
+
 function restoreSnapshot(snapshot) {
   if (!snapshot?.root) return;
   mindmap = new MindMap(cloneRoot(snapshot.root), cloneLinks(snapshot.links));
@@ -841,6 +884,7 @@ function restoreSnapshot(snapshot) {
 }
 
 function undo() {
+  commitActiveEdit();
   const item = undoStack.pop();
   if (!item) return;
   redoStack.push({ label: item.label, snapshot: captureSnapshot(), time: Date.now() });
@@ -850,6 +894,7 @@ function undo() {
 }
 
 function redo() {
+  commitActiveEdit();
   const item = redoStack.pop();
   if (!item) return;
   undoStack.push({ label: item.label, snapshot: captureSnapshot(), time: Date.now() });
@@ -1011,6 +1056,8 @@ function reconcileParsedTree(parsedRoot, previousRoot, preservePrevious = true) 
 }
 
 function applyMarkdownText(value, options = {}) {
+  // Markdown 应用会替换当前节点树，先提交可能仍在画布上的编辑内容。
+  commitActiveEdit();
   const parsed = parseMarkdown(value);
   markdownText = value;
   updateMarkdownEditorValue(value);
@@ -1129,6 +1176,8 @@ function renderSelectionOnly() {
 function setActiveMode(mode, persist = true) {
   if (!['map', 'markdown', 'split'].includes(mode)) mode = 'map';
   if (mode === 'split' && window.innerWidth <= 768) mode = 'markdown';
+  // 切换工作区前先提交画布内的 contenteditable，避免隐藏编辑框后状态悬挂。
+  commitActiveEdit();
   const previousRect = getCanvasRect();
   const worldCenterX = (previousRect.width / 2 - viewport.x) / viewport.scale;
   const worldCenterY = (previousRect.height / 2 - viewport.y) / viewport.scale;
@@ -1235,9 +1284,11 @@ function createNodePort(node, type) {
 
 function renderNodes() {
   const container = $('#nodes');
-  // 保留正在编辑的节点引用，避免抖动
-  const prevEditing = editing ? $('.node.editing') : null;
+  // 先把可能正在编辑的节点落盘，避免 render 把它从 DOM 摘掉后
+  // 没有 blur 事件、导致 `editing` 标志卡死。
+  if (activeEditCommit) activeEditCommit();
   container.innerHTML = '';
+  nodeElements.clear();
 
   const walk = (node) => {
     if (node !== mindmap.root && mindmap.isCollapsedAncestor(node)) return;
@@ -1291,6 +1342,7 @@ function renderNodes() {
     }
 
     container.appendChild(el);
+    nodeElements.set(node.id, el);
     // 折叠节点只保留自身，不能继续渲染隐藏子树的节点和连线。
     if (node.collapsed) return;
     node.children.forEach(walk);
@@ -1299,7 +1351,8 @@ function renderNodes() {
 }
 
 function getNodePortWorldPosition(node, type) {
-  const nodeEl = Array.from($$('.node')).find((el) => el.dataset.id === node.id);
+  let nodeEl = nodeElements.get(node.id);
+  if (nodeEl && !nodeEl.isConnected) nodeEl = null;
   const width = nodeEl?.offsetWidth || (node === mindmap.root ? 160 : 128);
   return {
     x: node.x + (type === 'input' ? -width / 2 : width / 2),
@@ -1492,15 +1545,16 @@ function renderMinimap() {
   if (!minimap) return;
   minimap.innerHTML = '';
   const bounds = computeBounds(mindmap.root);
-  if (bounds.width === 0 && bounds.height === 0) return;
 
   const padding = 8;
   const w = minimap.clientWidth - padding * 2;
   const h = minimap.clientHeight - padding * 2;
   if (w <= 0 || h <= 0) return;
-  const s = Math.min(w / Math.max(bounds.width, 100), h / Math.max(bounds.height, 100));
-  const ox = padding + (w - bounds.width * s) / 2 - bounds.minX * s;
-  const oy = padding + (h - bounds.height * s) / 2 - bounds.minY * s;
+  const contentWidth = Math.max(bounds.width, 100);
+  const contentHeight = Math.max(bounds.height, 100);
+  const s = Math.min(w / contentWidth, h / contentHeight);
+  const ox = padding + w / 2 - bounds.centerX * s;
+  const oy = padding + h / 2 - bounds.centerY * s;
 
   const walk = (node, depth = 0) => {
     if (mindmap.isCollapsedAncestor(node)) return;
@@ -1563,7 +1617,7 @@ function updateNodeToolbar() {
     return;
   }
   const node = mindmap.nodes.get(selectedId);
-  if (!node) {
+  if (!node || (node !== mindmap.root && mindmap.isCollapsedAncestor(node))) {
     bar.classList.add('hidden');
     return;
   }
@@ -1852,38 +1906,44 @@ function handleToolAction(action, id) {
       break;
     }
     case 'add-parent': {
-      const before = captureSnapshot();
-      const oldParent = mindmap.findParent(node) || mindmap.root;
-      if (oldParent === mindmap.root) {
+      const oldParent = mindmap.findParent(node);
+      if (!oldParent || oldParent === mindmap.root) {
         showToast('根节点已是顶层');
         return;
       }
-      const grandparent = mindmap.findParent(oldParent) || mindmap.root;
-      const newParent = mindmap.addChild(grandparent.id, '新父级');
-      if (!newParent) return;
-      // 把当前节点的旧父级移到新父级下（保留结构）
-      const idx = oldParent.children.indexOf(node);
-      if (idx >= 0) oldParent.children.splice(idx, 1);
-      newParent.children.push(node);
-      // 重新定位新父级到当前节点上方
-      const offset = 120;
-      newParent.x = node.x;
-      newParent.y = node.y - offset;
-      // 把旧父级也放到新父级下（避免脱离树）
-      if (oldParent !== mindmap.root) {
-        const opIdx = grandparent.children.indexOf(oldParent);
-        if (opIdx >= 0) grandparent.children.splice(opIdx, 1);
-        newParent.children.push(oldParent);
-        oldParent.x = node.x - 100;
-        oldParent.y = node.y;
+
+      // 新的树边会把旧父级连到新父级、再连到当前节点；先检查反向自由连线，
+      // 避免添加父级后在工作流 DAG 中形成循环。
+      if (mindmap.hasPath(node.id, oldParent.id)) {
+        showToast('无法添加父级：会形成循环');
+        return;
       }
-      mindmap.rebuildIndex();
+
+      const before = captureSnapshot();
+      const index = oldParent.children.indexOf(node);
+      const newParent = mindmap.addChild(oldParent.id, '新父级', {
+        x: oldParent.x + (node.x - oldParent.x) / 2,
+        y: node.y - 72,
+        radius: 0,
+      });
+      if (!newParent) return;
+
+      // addChild 会先把新节点追加到末尾，再替换当前节点原来的位置，
+      // 这样原父级的其他兄弟节点和顺序都不会改变。
+      oldParent.children.pop();
+      oldParent.children.splice(Math.max(0, index), 1, newParent);
+      newParent.children.push(node);
       selectedId = newParent.id;
       window.__pendingNewNodeId = newParent.id;
       finishMapChange('添加父级节点', before, { editId: newParent.id });
       break;
     }
     case 'duplicate': {
+      // 根节点没有父级，复制会把整张脑图挂到它自己下面。
+      if (id === mindmap.root.id) {
+        showToast('根节点不能复制');
+        return;
+      }
       const before = captureSnapshot();
       const clone = deepCloneNode(node);
       if (!clone) return;
@@ -1958,10 +2018,6 @@ function updateDragVisuals(node) {
   // 仅增量更新被拖拽节点相关的连线（消除每帧全量重绘的抖动）
   updateDragConnectionsFor(node);
   scheduleMinimapRender();
-}
-
-function updateConnectionsFor(node) {
-  updateDragConnectionsFor(node);
 }
 
 function updateDragConnectionsFor(node) {
@@ -2090,6 +2146,7 @@ function setupEvents() {
 
     if (spaceHeld || e.button === 1) {
       panning = true;
+      spacePanned = true;
       panStart = { x: e.clientX, y: e.clientY, vx: viewport.x, vy: viewport.y };
       vp.classList.add('panning');
       e.preventDefault();
@@ -2105,12 +2162,14 @@ function setupEvents() {
   // 鼠标移动
   let dragRafId = null;
   let lastMouse = { x: 0, y: 0 };
+  const cancelDragFrame = () => {
+    if (!dragRafId) return;
+    cancelAnimationFrame(dragRafId);
+    dragRafId = null;
+  };
 
   const finishTouchGesture = (cancelDrag = false) => {
-    if (dragRafId) {
-      cancelAnimationFrame(dragRafId);
-      dragRafId = null;
-    }
+    cancelDragFrame();
     if (draggingNode) {
       draggingElement?.classList.remove('dragging');
       const snapshot = dragStartSnapshot;
@@ -2248,10 +2307,7 @@ function setupEvents() {
       finishLinkDrag(e.clientX, e.clientY);
       return;
     }
-    if (dragRafId) {
-      cancelAnimationFrame(dragRafId);
-      dragRafId = null;
-    }
+    cancelDragFrame();
     if (draggingNode) {
       draggingElement?.classList.remove('dragging');
       // 还原 z-index
@@ -2459,7 +2515,7 @@ function setupEvents() {
       // 编辑中：Esc / Enter 由编辑框处理
       return;
     }
-    if (e.target.closest?.('#markdown-editor')) return;
+    if (isEditableTarget(e.target)) return;
 
     if (linkDrag && e.key === 'Escape') {
       e.preventDefault();
@@ -2479,16 +2535,24 @@ function setupEvents() {
       return;
     }
 
+    // 适配视图不依赖选中节点；带修饰键时让给浏览器（如 Ctrl+F 查找）。
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.key === 'f' || e.key === 'F')) {
+      e.preventDefault();
+      viewport.fitToContent(mindmap);
+      return;
+    }
+
     if (selectedLinkId && (e.key === 'Delete' || e.key === 'Backspace')) {
       e.preventDefault();
       removeSelectedLink();
       return;
     }
 
-    if (e.code === 'Space' && document.activeElement.tagName !== 'TEXTAREA') {
+    if (e.code === 'Space' && !isEditableTarget(document.activeElement)) {
       e.preventDefault();
       if (!spaceHeld) {
         spaceHeld = true;
+        spacePanned = false;
         vp.classList.add('space-held');
       }
     }
@@ -2518,12 +2582,6 @@ function setupEvents() {
       } else if (e.key === 'F2') {
         e.preventDefault();
         editNode(selectedId);
-      } else if (e.key === ' ' && !e.repeat) {
-        e.preventDefault();
-        handleToolAction('collapse', selectedId);
-      } else if (e.key === 'f' || e.key === 'F') {
-        e.preventDefault();
-        viewport.fitToContent(mindmap);
       }
     }
 
@@ -2532,6 +2590,7 @@ function setupEvents() {
         closeNodePicker();
       } else if (draggingNode) {
         // 取消拖拽：恢复到按下节点前的快照
+        cancelDragFrame();
         draggingElement?.classList.remove('dragging');
         document.querySelectorAll(
           `.connection[data-from="${draggingNode.id}"], .connection[data-to="${draggingNode.id}"]`
@@ -2564,9 +2623,15 @@ function setupEvents() {
   });
 
   window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') {
-      spaceHeld = false;
-      vp.classList.remove('space-held');
+    if (e.code !== 'Space') return;
+    const panned = spacePanned;
+    spaceHeld = false;
+    spacePanned = false;
+    vp.classList.remove('space-held');
+    // Space 兼作折叠快捷键和平移修饰键：只有没真的平移过才当成折叠，
+    // 否则每次 Space+拖拽都会先把选中节点折叠掉。
+    if (!panned && !editing && selectedId && !isEditableTarget(e.target)) {
+      handleToolAction('collapse', selectedId);
     }
   });
 
@@ -2591,7 +2656,8 @@ function reparent(childId, newParentId) {
   const child = mindmap.nodes.get(childId);
   const newParent = mindmap.nodes.get(newParentId);
   if (!child || !newParent) return;
-  const before = captureSnapshot();
+  const oldParent = mindmap.findParent(child);
+  if (oldParent === newParent) return;
 
   // 不能挂到自己的后代上
   let p = newParent;
@@ -2600,8 +2666,15 @@ function reparent(childId, newParentId) {
     p = mindmap.findParent(p);
   }
 
+  // 层级边也属于同一张 DAG；若已有反向路径，挂载后会形成循环。
+  if (mindmap.hasPath(childId, newParentId)) {
+    showToast('无法调整节点层级：会形成循环');
+    return;
+  }
+
+  const before = captureSnapshot();
+
   // 从原父节点移除
-  const oldParent = mindmap.findParent(child);
   if (oldParent) {
     const idx = oldParent.children.indexOf(child);
     if (idx >= 0) oldParent.children.splice(idx, 1);
@@ -2609,6 +2682,11 @@ function reparent(childId, newParentId) {
 
   // 添加到新父
   newParent.children.push(child);
+  // 目标节点与当前节点若已有自由连线，改成树边后删除冗余副本，
+  // 避免同一对节点出现两条重叠连线。
+  mindmap.links = mindmap.links.filter((link) => (
+    !(link.from === newParent.id && link.to === child.id)
+  ));
 
   // 重新定位到新父节点右侧，避免每次关联后位置随机跳动
   newParent.collapsed = false;
@@ -2634,6 +2712,9 @@ function deselectAll() {
 let pendingEditTimer = null;
 let pendingEditId = null;
 let editingSnapshot = null;
+// renderNodes 在重建前会调用此函数强制结束编辑，否则 contenteditable 被
+// 从 DOM 移除时不会触发 blur，`editing` 标志会卡在 true，所有快捷键失效。
+let activeEditCommit = null;
 
 function scheduleEdit(id, delay = 0) {
   // 取消上一个未触发的编辑请求（连点新建时会触发）
@@ -2694,6 +2775,7 @@ function editNode(id) {
 
   const finish = (commit) => {
     if (!editing) return;
+    activeEditCommit = null;
     editing = false;
     textEl.contentEditable = 'false';
     el.classList.remove('editing');
@@ -2712,6 +2794,21 @@ function editNode(id) {
     } else {
       render();
     }
+  };
+
+  // 暴露给 renderNodes：若 render 在用户改字过程中触发，强制把当前文本落盘，
+  // 避免 contenteditable 被 detach 后 `editing` 卡死。
+  activeEditCommit = () => {
+    if (editing && el.isConnected) {
+      // 用户在焦点丢失前先主动改字了，直接当成 blur 处理
+      const t = textEl.textContent.replace(/\s+/g, ' ').trim();
+      const newText = t || '双击编辑';
+      if (newText !== (node.text || '双击编辑')) {
+        finish(true);
+        return;
+      }
+    }
+    finish(false);
   };
 
   const onBlur = () => finish(true);
@@ -2839,6 +2936,7 @@ function setupToolbar() {
     addChildNode(mindmap.root.id);
   });
   $('#btn-auto-layout').addEventListener('click', () => {
+    commitActiveEdit();
     const before = captureSnapshot();
     autoLayout(mindmap.root);
     finishMapChange('整理布局', before);
@@ -2931,6 +3029,7 @@ function setupToolbar() {
   });
 
   $('#btn-clear').addEventListener('click', () => {
+    commitActiveEdit();
     if (mindmap.count() === 1 && !mindmap.root.children.length) {
       showToast('当前已经是空白脑图');
       return;
@@ -2967,10 +3066,6 @@ function setupToolbar() {
   $('#zoom-reset').addEventListener('click', () => {
     viewport.reset();
   });
-}
-
-function closeModal() {
-  $('#modal')?.classList.add('hidden');
 }
 
 function exportMarkdown() {
@@ -3033,6 +3128,7 @@ function openJsonFile(file) {
       showToast('JSON 中没有有效脑图');
       return;
     }
+    commitActiveEdit();
     const before = captureSnapshot();
     mindmap = nextMap;
     selectedId = null;

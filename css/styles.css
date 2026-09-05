@@ -1824,8 +1824,7 @@ textarea:focus-visible,
 .node-port-output:hover {
   transform: translate(50%, -50%) scale(1.28);
 }
-.node:not(.depth-0) > .node-add-child,
-.node.depth-0 > .node-add-child {
+.node:not(.depth-0) > .node-add-child {
   right: -14px;
   top: 50%;
   bottom: auto;
@@ -1833,13 +1832,10 @@ textarea:focus-visible,
   transform: translateY(-50%) scale(0.7);
 }
 .node:not(.depth-0):hover > .node-add-child,
-.node:not(.depth-0).selected > .node-add-child,
-.node.depth-0:hover > .node-add-child,
-.node.depth-0.selected > .node-add-child {
+.node:not(.depth-0).selected > .node-add-child {
   transform: translateY(-50%) scale(1);
 }
-.node:not(.depth-0) > .node-add-child:hover,
-.node.depth-0 > .node-add-child:hover {
+.node:not(.depth-0) > .node-add-child:hover {
   transform: translateY(-50%) scale(1.15) !important;
 }
 .connection.free {
