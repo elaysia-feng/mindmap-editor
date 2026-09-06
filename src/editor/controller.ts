@@ -1,3 +1,7 @@
+// 当前编辑器核心大量依赖 DOM 和 Pointer Events，先保留成熟的交互实现；
+// Vue 组件只负责宿主结构，后续可在不改变交互契约的前提下逐步补充类型。
+// @ts-nocheck
+
 /* ===========================
    脑图编辑器 · MindMap Studio
    主程序
@@ -19,6 +23,35 @@ const isEditableTarget = (target) => Boolean(
 function setSourceLine(node, line) {
   Object.defineProperty(node, '__sourceLine', {
     value: line,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  return node;
+}
+
+function setMarkdownSyntax(node, kind, level = 0, indent = 0, marker = '-') {
+  if (!kind) return node;
+  Object.defineProperty(node, '__markdownKind', {
+    value: kind,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  Object.defineProperty(node, '__markdownLevel', {
+    value: level,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  Object.defineProperty(node, '__markdownIndent', {
+    value: indent,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+  Object.defineProperty(node, '__markdownMarker', {
+    value: marker,
     writable: true,
     configurable: true,
     enumerable: false,
@@ -123,6 +156,9 @@ class MindMap {
       children: [],
       collapsed: false,
     };
+    const inheritedKind = parent.__markdownKind === 'list' ? 'list' : 'heading';
+    const inheritedMarker = inheritedKind === 'list' ? parent.__markdownMarker : '-';
+    setMarkdownSyntax(node, inheritedKind, 0, 0, inheritedMarker);
     parent.children.push(node);
     this.nodes.set(node.id, node);
     return node;
@@ -273,18 +309,35 @@ class MindMap {
   toMarkdownData() {
     const lines = [];
     const nodeLines = new Map();
-    const walk = (node, level) => {
+    const walk = (node, level, nearestHeadingDepth = 0) => {
       const text = node.text || '';
       nodeLines.set(node.id, lines.length);
+      const kind = node.__markdownKind;
+      const listMarker = kind === 'list' && /^([-*+]|\d+\.)$/.test(node.__markdownMarker || '')
+        ? node.__markdownMarker
+        : '-';
+      const listIndent = '  '.repeat(Math.max(0, level - nearestHeadingDepth - 1));
+      let outputHeading = false;
       if (level === 0) {
         lines.push(`# ${text}`);
-      } else if (level <= 4) {
+        outputHeading = true;
+      } else if (kind === 'list') {
+        lines.push(`${listIndent}${listMarker} ${text}`);
+      } else if (kind === 'blockquote' && level === nearestHeadingDepth + 1) {
+        lines.push(`> ${text}`);
+      } else if (kind === 'heading' && level <= 5) {
         lines.push(`${'#'.repeat(level + 1)} ${text}`);
+        outputHeading = true;
+      } else if (!kind && level <= 4) {
+        // 没有来源语法的画布新节点沿用旧版的浅层标题输出规则。
+        lines.push(`${'#'.repeat(level + 1)} ${text}`);
+        outputHeading = true;
       } else {
-        // 第一层列表必须顶格：缩进 4 个空格以上会被标准 Markdown 当成代码块。
-        lines.push(`${'  '.repeat(level - 5)}- ${text}`);
+        // 深层标题无法继续增加层级，退化为当前标题下的列表节点。
+        lines.push(`${listIndent}- ${text}`);
       }
-      node.children.forEach((c) => walk(c, level + 1));
+      const nextHeadingDepth = outputHeading ? level : nearestHeadingDepth;
+      node.children.forEach((c) => walk(c, level + 1, nextHeadingDepth));
     };
     walk(this.root, 0);
     return { text: lines.join('\n'), nodeLines };
@@ -339,6 +392,130 @@ const DEFAULT_SAMPLE = {
 };
 
 /* ============== Markdown 解析 ============== */
+function isMarkdownSeparator(line) {
+  return /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line);
+}
+
+function isSupportedMarkdownLine(line) {
+  if (!line.trim()) return true;
+  if (isMarkdownSeparator(line)) return true;
+  if (/^(#{1,6})\s+(.+)$/.test(line)) return true;
+  if (/^(\s*)([-*+]|\d+\.)\s+(.+)$/.test(line)) return true;
+  if (/^(?:>\s*)+(.+)$/.test(line)) return true;
+  return false;
+}
+
+function migrateLegacyListGroups(text) {
+  const source = typeof text === 'string' ? text : '';
+  const lines = source.split(/\r?\n/);
+  const isFlatList = (line) => /^(\s*)([-*+]|\d+\.)\s+(.+)$/.exec(line);
+  const isGroupLead = (content) => /(?:问题|特点|原因|方式|方法|步骤|场景|地方|标准|关键词|判断|说明|要求|结果|情况|内容).*[:：]\s*$/.test(content);
+  const isConclusion = (content) => /^(所以|因此|总之|结论|总结|否则)/.test(content.trim());
+  const migrated = [...lines];
+
+  lines.forEach((line, parentIndex) => {
+    const parent = isFlatList(line);
+    if (!parent || parent[1] || !isGroupLead(parent[3])) return;
+
+    let index = parentIndex + 1;
+    let grouped = false;
+    while (index < lines.length) {
+      if (!lines[index].trim()) {
+        index++;
+        continue;
+      }
+      const child = isFlatList(lines[index]);
+      if (!child || child[1] || isGroupLead(child[3]) || isConclusion(child[3])) break;
+      migrated[index] = `  ${migrated[index]}`;
+      grouped = true;
+      index++;
+    }
+    if (!grouped) return;
+  });
+
+  return migrated.join(source.includes('\r\n') ? '\r\n' : '\n');
+}
+
+/**
+ * 将编辑器不支持的普通文本转换为可解析的 Markdown 节点。
+ * 保留每一行，避免粘贴说明文档时出现整段内容丢失。
+ */
+export function normalizeMarkdown(text, selection = null) {
+  const source = typeof text === 'string' ? text : '';
+  const lines = source.split(/\r?\n/);
+  const newline = source.includes('\r\n') ? '\r\n' : '\n';
+  const prefixLengths = Array(lines.length).fill(0);
+  const convertedFlags = Array(lines.length).fill(false);
+  let hasMeaningfulLine = false;
+  const normalizedLines = lines.map((raw, index) => {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim() || isSupportedMarkdownLine(line)) {
+      if (line.trim() && !isMarkdownSeparator(line)) hasMeaningfulLine = true;
+      return raw;
+    }
+
+    const prefix = hasMeaningfulLine ? '- ' : '# ';
+    prefixLengths[index] = prefix.length;
+    convertedFlags[index] = true;
+    hasMeaningfulLine = true;
+    return `${prefix}${line.trim()}`;
+  });
+
+  // 普通说明行后面的列表属于这段说明，自动补两格缩进，形成“说明节点 → 原因列表”。
+  // 只处理刚刚转换出的普通行，已经合法的 Markdown 列表保持原样，保证规范输入幂等。
+  const getListMatch = (line) => line.match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
+  const isFlatListLine = (line) => {
+    const match = getListMatch(line);
+    return Boolean(match && !match[1]);
+  };
+  const findNextContent = (start) => {
+    for (let index = start; index < lines.length; index++) {
+      if (lines[index].trim()) return index;
+    }
+    return -1;
+  };
+  const groupedListLines = new Set();
+  convertedFlags.forEach((converted, parentIndex) => {
+    if (!converted || !normalizedLines[parentIndex].startsWith('- ')) return;
+    let index = findNextContent(parentIndex + 1);
+    if (index < 0 || !isFlatListLine(lines[index])) return;
+    while (index >= 0 && index < lines.length && isFlatListLine(lines[index])) {
+      groupedListLines.add(index);
+      index = findNextContent(index + 1);
+    }
+  });
+  groupedListLines.forEach((index) => {
+    normalizedLines[index] = `  ${normalizedLines[index]}`;
+    prefixLengths[index] += 2;
+  });
+
+  const convertedLines = convertedFlags.reduce((result, converted, index) => {
+    if (converted) result.push(index + 1);
+    return result;
+  }, []);
+  const convertedCount = convertedLines.length;
+  const normalizedText = normalizedLines.join(newline);
+
+  const mapOffset = (offset) => {
+    const safeOffset = clamp(Number(offset) || 0, 0, source.length);
+    const lineIndex = source.slice(0, safeOffset).split('\n').length - 1;
+    const previousPrefixes = prefixLengths
+      .slice(0, lineIndex)
+      .reduce((total, length) => total + length, 0);
+    return clamp(safeOffset + previousPrefixes + (prefixLengths[lineIndex] || 0), 0,
+      normalizedText.length);
+  };
+
+  return {
+    text: normalizedText,
+    convertedCount,
+    convertedLines,
+    selection: selection
+      ? { start: mapOffset(selection.start), end: mapOffset(selection.end) }
+      : null,
+  };
+}
+
 function parseMarkdown(text) {
   const root = {
     id: uid(),
@@ -366,11 +543,14 @@ function parseMarkdown(text) {
     if (!line.trim()) continue;
 
     // Markdown 分隔线只用于排版，不生成脑图节点，也不影响后续层级。
-    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) continue;
+    if (isMarkdownSeparator(line)) continue;
 
     let level = 1;
     let content = '';
     let matched = false;
+    let markdownKind = null;
+    let markdownIndent = 0;
+    let markdownMarker = '-';
 
     // 标题: # ## ### ...
     const heading = line.match(/^(#{1,6})\s+(.+)$/);
@@ -378,10 +558,13 @@ function parseMarkdown(text) {
       level = heading[1].length;
       content = heading[2].trim();
       matched = true;
+      markdownKind = 'heading';
+      markdownMarker = heading[1];
       currentHeadingLevel = level;
       if (!firstHeadingDone) {
         root.text = content;
         setSourceLine(root, lineIndex);
+        setMarkdownSyntax(root, markdownKind, level, 0, markdownMarker);
         firstHeadingDone = true;
         hasAnyContent = true;
         continue; // 第一个标题作为根节点文本
@@ -395,6 +578,9 @@ function parseMarkdown(text) {
         level = currentHeadingLevel + 1 + Math.floor(indent / 2);
         content = list[3].trim();
         matched = true;
+        markdownKind = 'list';
+        markdownIndent = indent;
+        markdownMarker = list[2];
         if (indent % 2 !== 0) {
           diagnostics.push({
             line: lineIndex + 1,
@@ -409,6 +595,8 @@ function parseMarkdown(text) {
           level = currentHeadingLevel + 1;
           content = blockquote[1].trim();
           matched = true;
+          markdownKind = 'blockquote';
+          markdownMarker = '>';
         }
       }
     }
@@ -428,14 +616,14 @@ function parseMarkdown(text) {
       stack.pop();
     }
 
-    const newNode = setSourceLine({
+    const newNode = setMarkdownSyntax(setSourceLine({
       id: uid(),
       text: content,
       x: 0,
       y: 0,
       children: [],
       collapsed: false,
-    }, lineIndex);
+    }, lineIndex), markdownKind, level, markdownIndent, markdownMarker);
 
     if (stack.length === 0) {
       root.children.push(newNode);
@@ -526,12 +714,28 @@ const EXAMPLES = {
 - 缺乏规划`,
 };
 
-/* ============== 自动布局（飞书/XMind 风格：右向水平树） ============== */
+/* ============== 自动布局（XMind 风格：根节点两侧分流） ============== */
 function autoLayout(root) {
   // 第一遍：自底向上计算每个子树需要的垂直空间
-  const H_GAP = 14;       // 同级子节点之间的垂直间距
-  const X_GAP = 250;       // 父子节点之间的基础水平间距
+  const H_GAP = 24;       // 同级子节点之间的垂直间距
+  const COLUMN_GAP = 42;  // 相邻层级卡片之间的净空
   const MIN_NODE_H = 40;   // 短文本节点的最小高度
+  const NODE_WIDTHS = [360, 260, 240, 220, 200, 185, 170];
+  const columnX = [0];
+
+  const widthForDepth = (depth) => NODE_WIDTHS[Math.min(depth, NODE_WIDTHS.length - 1)];
+  const xForDepth = (depth) => {
+    while (columnX.length <= depth) {
+      const currentDepth = columnX.length;
+      columnX.push(
+        columnX[currentDepth - 1]
+        + widthForDepth(currentDepth - 1) / 2
+        + COLUMN_GAP
+        + widthForDepth(currentDepth) / 2,
+      );
+    }
+    return columnX[depth];
+  };
 
   function estimateNodeHeight(node, depth) {
     const isRoot = depth === 0;
@@ -569,7 +773,7 @@ function autoLayout(root) {
   }
 
   function gapForDepth(depth) {
-    return Math.max(8, H_GAP - depth);
+    return Math.max(12, H_GAP - depth * 1.5);
   }
 
   function calcHeight(node, depth = 0) {
@@ -587,9 +791,9 @@ function autoLayout(root) {
     return node._h;
   }
 
-  // 第二遍：根据父节点位置放置子节点（垂直均匀分布在该父节点两侧）
-  function place(node, x, yCenter, depth = 0) {
-    node.x = x;
+  // 第二遍：一级主题分到根节点两侧，子树沿所在侧向外展开。
+  function place(node, yCenter, depth = 0, side = 'right') {
+    node.x = depth === 0 || side === 'right' ? xForDepth(depth) : -xForDepth(depth);
     node.y = yCenter;
     if (node.children.length === 0 || node.collapsed) return;
 
@@ -598,21 +802,35 @@ function autoLayout(root) {
                  + childGap * (node.children.length - 1);
     let curTop = yCenter - totalH / 2;
 
-    // 深度越大水平间距越紧凑，但保留足够空间放置节点卡片。
-    const depthScale = Math.max(0.68, 1 - depth * 0.06);
-    const xGap = X_GAP * depthScale;
-
     node.children.forEach((c) => {
       const childCenter = curTop + c._h / 2;
-      place(c, x + xGap, childCenter, depth + 1);
+      place(c, childCenter, depth + 1, side);
       curTop += c._h + childGap;
     });
   }
 
   calcHeight(root);
-  place(root, 0, 0, 0);
+  root.x = xForDepth(0);
+  root.y = 0;
+  if (!root.collapsed && root.children.length > 0) {
+    const leftCount = Math.floor(root.children.length / 2);
+    const placeGroup = (children, side) => {
+      if (children.length === 0) return;
+      const groupGap = gapForDepth(0);
+      const totalH = children.reduce((sum, child) => sum + child._h, 0)
+        + groupGap * (children.length - 1);
+      let curTop = -totalH / 2;
+      children.forEach((child) => {
+        const childCenter = curTop + child._h / 2;
+        place(child, childCenter, 1, side);
+        curTop += child._h + groupGap;
+      });
+    };
+    placeGroup(root.children.slice(0, leftCount), 'left');
+    placeGroup(root.children.slice(leftCount), 'right');
+  }
 
-  // 居中：让根节点在 (0, 0)
+  // 居中：让整张图的内容落在画布中央，根节点位于两侧分支之间。
   const b = computeBounds(root);
   const dx = -b.centerX;
   const dy = -b.centerY;
@@ -797,7 +1015,24 @@ let pendingNodeCreation = null;
 
 /* ============== 文档状态与历史 ============== */
 function cloneRoot(root) {
-  return JSON.parse(JSON.stringify(root));
+  const clone = JSON.parse(JSON.stringify(root));
+  const copyMarkdownSyntax = (source, target) => {
+    if (!source || !target) return;
+    if (source.__markdownKind) {
+      setMarkdownSyntax(
+        target,
+        source.__markdownKind,
+        source.__markdownLevel,
+        source.__markdownIndent,
+        source.__markdownMarker,
+      );
+    }
+    source.children?.forEach((child, index) => {
+      copyMarkdownSyntax(child, target.children?.[index]);
+    });
+  };
+  copyMarkdownSyntax(root, clone);
+  return clone;
 }
 
 function cloneLinks(links) {
@@ -941,16 +1176,26 @@ function updateMarkdownLineMapsFromTree(root) {
   lineMap.forEach((line, id) => markdownLineNodes.set(line, id));
 }
 
-function updateMarkdownEditorValue(value) {
+function updateMarkdownEditorValue(value, selection = null) {
   const editor = $('#markdown-editor');
-  if (!editor || editor.value === value) {
+  if (!editor) {
     updateMarkdownGutter();
     return;
   }
 
   const isFocused = document.activeElement === editor;
-  const start = editor.selectionStart;
-  const end = editor.selectionEnd;
+  const start = selection?.start ?? editor.selectionStart;
+  const end = selection?.end ?? editor.selectionEnd;
+  if (editor.value === value) {
+    if (isFocused && selection) {
+      editor.setSelectionRange(
+        clamp(start, 0, value.length),
+        clamp(end, 0, value.length),
+      );
+    }
+    updateMarkdownGutter();
+    return;
+  }
   editor.value = value;
   if (isFocused) {
     const nextStart = clamp(start, 0, value.length);
@@ -988,21 +1233,28 @@ function clearMarkdownLineMaps() {
 function renderMarkdownDiagnostics(diagnostics) {
   const errors = diagnostics.filter((item) => item.severity === 'error');
   const warnings = diagnostics.filter((item) => item.severity === 'warning');
+  const infos = diagnostics.filter((item) => item.severity === 'info');
   const error = $('#markdown-error');
   if (error) {
-    error.dataset.state = errors.length > 0 ? 'error' : warnings.length > 0 ? 'warning' : '';
-    if (errors.length > 0) {
-      error.textContent = errors.map((item) => `第 ${item.line} 行：${item.message}`).join('；');
-      error.classList.remove('hidden');
-    } else {
-      error.textContent = warnings.map((item) => `第 ${item.line} 行：${item.message}`).join('；');
-      error.classList.toggle('hidden', warnings.length === 0);
-    }
+    const visibleDiagnostics = errors.length > 0 ? errors
+      : warnings.length > 0 ? warnings
+        : infos;
+    const state = errors.length > 0 ? 'error'
+      : warnings.length > 0 ? 'warning'
+        : infos.length > 0 ? 'info' : '';
+    if (state) error.dataset.state = state;
+    else delete error.dataset.state;
+    error.textContent = visibleDiagnostics.map((item) => (
+      Number.isInteger(item.line) ? `第 ${item.line} 行：${item.message}` : item.message
+    )).join('；');
+    error.classList.toggle('hidden', visibleDiagnostics.length === 0);
   }
   if (errors.length > 0) {
     setMarkdownStatus('解析失败', 'error');
   } else if (warnings.length > 0) {
     setMarkdownStatus('已应用，有提示', 'warning');
+  } else if (infos.length > 0) {
+    setMarkdownStatus('已自动整理', 'info');
   } else {
     setMarkdownStatus('已同步', 'synced');
   }
@@ -1031,6 +1283,16 @@ function reconcileNode(parsed, previous, parent = null, index = 0, preservePrevi
     collapsed: hasPrevious ? !!previous.collapsed : false,
   };
   if (Number.isInteger(parsed.__sourceLine)) setSourceLine(node, parsed.__sourceLine);
+  const syntaxSource = parsed.__markdownKind ? parsed : previous;
+  if (syntaxSource?.__markdownKind) {
+    setMarkdownSyntax(
+      node,
+      syntaxSource.__markdownKind,
+      syntaxSource.__markdownLevel,
+      syntaxSource.__markdownIndent,
+      syntaxSource.__markdownMarker,
+    );
+  }
 
   const oldChildren = previous?.children || [];
   const used = new Set();
@@ -1058,25 +1320,42 @@ function reconcileParsedTree(parsedRoot, previousRoot, preservePrevious = true) 
 function applyMarkdownText(value, options = {}) {
   // Markdown 应用会替换当前节点树，先提交可能仍在画布上的编辑内容。
   commitActiveEdit();
-  const parsed = parseMarkdown(value);
-  markdownText = value;
-  updateMarkdownEditorValue(value);
-  renderMarkdownDiagnostics(parsed.diagnostics);
+  const editor = $('#markdown-editor');
+  const selection = editor && document.activeElement === editor
+    ? { start: editor.selectionStart, end: editor.selectionEnd }
+    : null;
+  const normalized = normalizeMarkdown(value, selection);
+  const parsed = parseMarkdown(normalized.text);
+  const diagnostics = [...parsed.diagnostics];
+  if (normalized.convertedCount > 0) {
+    diagnostics.unshift({
+      message: `已自动将 ${normalized.convertedCount} 行普通文本转换为列表节点`,
+      severity: 'info',
+    });
+  }
+  markdownText = normalized.text;
+  updateMarkdownEditorValue(normalized.text, normalized.selection);
+  renderMarkdownDiagnostics(diagnostics);
   if (!parsed.valid) {
     clearMarkdownLineMaps();
     saveState();
     return false;
   }
 
+  markdownNeedsMigration = false;
+
   const before = captureSnapshot();
-  let parsedRoot = parsed.root;
-  if (options.forceLayout) autoLayout(parsedRoot);
+  const shouldAutoLayout = options.forceLayout
+    || options.preservePrevious === false
+    || mindmap.root.children.length === 0
+    || normalized.convertedCount > 0;
   const previousLinks = mindmap.links;
   const nextRoot = reconcileParsedTree(
-    parsedRoot,
+    parsed.root,
     mindmap.root,
     options.preservePrevious !== false,
   );
+  if (shouldAutoLayout) autoLayout(nextRoot);
   mindmap = new MindMap(
     nextRoot,
     options.preservePrevious !== false ? previousLinks : [],
@@ -1085,13 +1364,17 @@ function applyMarkdownText(value, options = {}) {
   if (selectedLinkId && !mindmap.links.some((link) => link.id === selectedLinkId)) {
     selectedLinkId = null;
   }
-  markdownLastValidText = value;
+  markdownLastValidText = normalized.text;
   updateMarkdownLineMapsFromTree(mindmap.root);
   recordHistory(options.label || '编辑 Markdown', before, options.coalesce !== false);
   render();
   saveState();
   if (hasDocumentContent()) $('#welcome')?.remove();
-  if (!parsed.diagnostics.some((item) => item.severity === 'warning')) {
+  if (parsed.diagnostics.some((item) => item.severity === 'warning')) {
+    setMarkdownStatus('已应用，有提示', 'warning');
+  } else if (normalized.convertedCount > 0) {
+    setMarkdownStatus(`已自动整理 ${normalized.convertedCount} 行`, 'info');
+  } else {
     setMarkdownStatus('已同步', 'synced');
   }
   return true;
@@ -1106,11 +1389,17 @@ function applyMarkdownDraft(options = {}) {
 function restoreSavedMarkdownDraft(savedText) {
   if (typeof savedText !== 'string' || !savedText) return;
 
-  const parsed = parseMarkdown(savedText);
+  const shouldMigrateMarkdown = markdownNeedsMigration;
+  const sourceText = shouldMigrateMarkdown
+    ? migrateLegacyListGroups(savedText)
+    : savedText;
+  const didMigrateMarkdown = sourceText !== savedText;
+  const normalized = normalizeMarkdown(sourceText);
+  const parsed = parseMarkdown(normalized.text);
   if (!parsed.valid) {
-    markdownText = savedText;
+    markdownText = sourceText;
     clearMarkdownLineMaps();
-    updateMarkdownEditorValue(savedText);
+    updateMarkdownEditorValue(sourceText);
     renderMarkdownDiagnostics(parsed.diagnostics);
     return;
   }
@@ -1118,16 +1407,35 @@ function restoreSavedMarkdownDraft(savedText) {
   // 保留用户打开文件时的 Markdown 排版，同时复用已保存的节点位置和 ID。
   const previousLinks = mindmap.links;
   const nextRoot = reconcileParsedTree(parsed.root, mindmap.root);
+  if (layoutNeedsMigration || didMigrateMarkdown || normalized.convertedCount > 0) {
+    autoLayout(nextRoot);
+  }
+  layoutNeedsMigration = false;
   mindmap = new MindMap(nextRoot, previousLinks);
   if (selectedId && !mindmap.nodes.has(selectedId)) selectedId = null;
   if (selectedLinkId && !mindmap.links.some((link) => link.id === selectedLinkId)) {
     selectedLinkId = null;
   }
-  markdownText = savedText;
-  markdownLastValidText = savedText;
+  markdownNeedsMigration = false;
+  markdownText = normalized.text;
+  markdownLastValidText = normalized.text;
   updateMarkdownLineMapsFromTree(mindmap.root);
-  updateMarkdownEditorValue(savedText);
-  renderMarkdownDiagnostics(parsed.diagnostics);
+  updateMarkdownEditorValue(normalized.text);
+  const diagnostics = [...parsed.diagnostics];
+  if (didMigrateMarkdown) {
+    diagnostics.unshift({
+      message: '已自动整理旧版列表层级',
+      severity: 'info',
+    });
+  }
+  if (normalized.convertedCount > 0) {
+    diagnostics.unshift({
+      message: `已自动将 ${normalized.convertedCount} 行普通文本转换为列表节点`,
+      severity: 'info',
+    });
+  }
+  renderMarkdownDiagnostics(diagnostics);
+  if (didMigrateMarkdown || normalized.convertedCount > 0) saveState();
 }
 
 function getLineStart(text, line) {
@@ -1210,8 +1518,9 @@ function render() {
 
 function defaultChildPosition(parent) {
   const index = parent.children.length;
+  const direction = parent !== mindmap.root && parent.x < mindmap.root.x ? -1 : 1;
   return {
-    x: parent.x + 240,
+    x: parent.x + direction * 240,
     y: parent.y + index * 72,
   };
 }
@@ -1296,6 +1605,7 @@ function renderNodes() {
     const el = document.createElement('div');
     el.className = 'node';
     el.dataset.id = node.id;
+    el.dataset.side = node !== mindmap.root && node.x < mindmap.root.x ? 'left' : 'right';
     el.style.left = node.x + 'px';
     el.style.top = node.y + 'px';
 
@@ -1314,7 +1624,7 @@ function renderNodes() {
     textSpan.textContent = node.text || '空';
     el.appendChild(textSpan);
 
-    // 工作流式输入端口；右侧的「+」就是输出端口，拖动它会拉出连线。
+    // 工作流式输入端口；节点外侧的「+」就是输出端口，拖动它会拉出连线。
     el.appendChild(createNodePort(node, 'input'));
 
     // Coze 风格输出端口：按住「+」拉线，落到空白处后再选择要创建的节点。
@@ -1350,14 +1660,22 @@ function renderNodes() {
   walk(mindmap.root);
 }
 
-function getNodePortWorldPosition(node, type) {
+function getNodePortWorldPosition(node, type, side = null) {
   let nodeEl = nodeElements.get(node.id);
   if (nodeEl && !nodeEl.isConnected) nodeEl = null;
   const width = nodeEl?.offsetWidth || (node === mindmap.root ? 160 : 128);
+  const isLeft = (side || (node !== mindmap.root && node.x < mindmap.root.x ? 'left' : 'right')) === 'left';
+  const edge = type === 'input'
+    ? (isLeft ? width / 2 : -width / 2)
+    : (isLeft ? -width / 2 : width / 2);
   return {
-    x: node.x + (type === 'input' ? -width / 2 : width / 2),
+    x: node.x + edge,
     y: node.y,
   };
+}
+
+function getConnectionSide(from, to) {
+  return to.x < from.x ? 'left' : 'right';
 }
 
 function getConnectionPathData(fromPoint, toPoint, laneOffset = 0) {
@@ -1367,7 +1685,7 @@ function getConnectionPathData(fromPoint, toPoint, laneOffset = 0) {
     return `M ${fromPoint.x} ${fromPoint.y} L ${toPoint.x} ${toPoint.y}`;
   }
 
-  // 节点通常从左向右连接，使用带圆角的正交折线，保证箭头水平进入输入端口。
+  // 按节点所在侧连接，使用带圆角的正交折线，保证箭头水平进入输入端口。
   const direction = dx >= 0 ? 1 : -1;
   const absDx = Math.abs(dx);
   if (absDx >= 48) {
@@ -1451,11 +1769,9 @@ function renderConnections() {
 
   const walk = (node) => {
     if (mindmap.isCollapsedAncestor(node) || node.collapsed) return;
-    node.children.forEach((child) => {
-      if (mindmap.isCollapsedAncestor(child)) return;
-      svg.appendChild(createConnectionPath(node, child));
-      walk(child);
-    });
+    const children = node.children.filter((child) => !mindmap.isCollapsedAncestor(child));
+    createTreeConnectionPaths(node).forEach((path) => svg.appendChild(path));
+    children.forEach(walk);
   };
   walk(mindmap.root);
   renderFreeConnections(svg);
@@ -1464,8 +1780,9 @@ function renderConnections() {
 }
 
 function createConnectionPath(from, to) {
-  const fromPoint = getNodePortWorldPosition(from, 'output');
-  const toPoint = getNodePortWorldPosition(to, 'input');
+  const side = getConnectionSide(from, to);
+  const fromPoint = getNodePortWorldPosition(from, 'output', side);
+  const toPoint = getNodePortWorldPosition(to, 'input', side);
   const path = SVG_PATH(getConnectionPathData(
     fromPoint,
     toPoint,
@@ -1476,9 +1793,83 @@ function createConnectionPath(from, to) {
   return applyConnectionState(path, from.id, to.id);
 }
 
+function createTreeConnectionPaths(from) {
+  const children = from.children.filter((child) => !mindmap.isCollapsedAncestor(child));
+  if (children.length < 2) {
+    return children.map((child) => createConnectionPath(from, child));
+  }
+
+  const leftChildren = children.filter((child) => child.x < from.x - 18);
+  const rightChildren = children.filter((child) => child.x > from.x + 18);
+  if (leftChildren.length + rightChildren.length !== children.length) {
+    return children.map((child) => createConnectionPath(from, child));
+  }
+
+  const createBranchPaths = (sideChildren, side) => {
+    if (sideChildren.length < 2) {
+      return sideChildren.map((child) => createConnectionPath(from, child));
+    }
+
+    const fromPoint = getNodePortWorldPosition(from, 'output', side);
+    const childPoints = sideChildren.map((child) => ({
+      child,
+      point: getNodePortWorldPosition(child, 'input', side),
+    }));
+    const nearestChildX = side === 'left'
+      ? Math.max(...childPoints.map(({ point }) => point.x))
+      : Math.min(...childPoints.map(({ point }) => point.x));
+    const branchSpace = side === 'left'
+      ? fromPoint.x - nearestChildX
+      : nearestChildX - fromPoint.x;
+    if (branchSpace <= 28) {
+      return sideChildren.map((child) => createConnectionPath(from, child));
+    }
+
+    // 多个子节点共享一条父级干线，再从干线分叉，避免每条边都重复穿过同一通道。
+    const trunkOffset = clamp(branchSpace * 0.48, 18, 96);
+    const trunkX = fromPoint.x + (side === 'left' ? -trunkOffset : trunkOffset);
+    const trunkTooClose = side === 'left'
+      ? trunkX <= nearestChildX + 8
+      : trunkX >= nearestChildX - 8;
+    if (trunkTooClose) {
+      return sideChildren.map((child) => createConnectionPath(from, child));
+    }
+
+    const topY = Math.min(...childPoints.map(({ point }) => point.y));
+    const bottomY = Math.max(...childPoints.map(({ point }) => point.y));
+    const depth = Math.min(6, mindmap.getDepth(from.id));
+    const trunk = SVG_PATH([
+      `M ${fromPoint.x} ${fromPoint.y}`,
+      `H ${trunkX}`,
+      `M ${trunkX} ${topY}`,
+      `V ${bottomY}`,
+    ].join(' '), 'connection tree-trunk');
+    trunk.dataset.depth = String(depth);
+    trunk.dataset.edgeKind = 'tree-trunk';
+    if (selectedId === from.id || sideChildren.some((child) => child.id === selectedId)) {
+      trunk.classList.add('highlighted');
+    }
+
+    const paths = [trunk];
+    childPoints.forEach(({ child, point }) => {
+      const branch = SVG_PATH(`M ${trunkX} ${point.y} H ${point.x}`, 'connection tree-branch');
+      branch.dataset.depth = String(Math.min(6, mindmap.getDepth(child.id)));
+      branch.dataset.edgeKind = 'tree';
+      paths.push(applyConnectionState(branch, from.id, child.id));
+    });
+    return paths;
+  };
+
+  return [
+    ...createBranchPaths(leftChildren, 'left'),
+    ...createBranchPaths(rightChildren, 'right'),
+  ];
+}
+
 function createFreeConnectionPath(link, from, to) {
-  const fromPoint = getNodePortWorldPosition(from, link.sourcePort || 'output');
-  const toPoint = getNodePortWorldPosition(to, link.targetPort || 'input');
+  const side = getConnectionSide(from, to);
+  const fromPoint = getNodePortWorldPosition(from, link.sourcePort || 'output', side);
+  const toPoint = getNodePortWorldPosition(to, link.targetPort || 'input', side);
   const path = SVG_PATH(
     getConnectionPathData(fromPoint, toPoint, getConnectionLaneOffset(from, to, link.id)),
     'connection free',
@@ -1689,9 +2080,10 @@ function renderLinkDragPreview(clientX, clientY) {
   }
   const targetPort = updateLinkDragTarget(clientX, clientY);
   const targetNode = targetPort ? mindmap.nodes.get(targetPort.dataset.nodeId) : null;
-  const fromPoint = getNodePortWorldPosition(source, 'output');
+  const side = targetNode ? getConnectionSide(source, targetNode) : null;
+  const fromPoint = getNodePortWorldPosition(source, 'output', side);
   const toPoint = targetNode
-    ? getNodePortWorldPosition(targetNode, 'input')
+    ? getNodePortWorldPosition(targetNode, 'input', side)
     : getCanvasWorldPoint(clientX, clientY);
   path.setAttribute('d', getConnectionPathData(fromPoint, toPoint));
 }
@@ -2865,7 +3257,11 @@ function handleContextAction(action, id) {
 /* ============== 存储 ============== */
 const STORAGE_KEY = 'mindmap-studio-v2';
 const LEGACY_STORAGE_KEY = 'mindmap-studio-v1';
+const LAYOUT_VERSION = 2;
+const MARKDOWN_FORMAT_VERSION = 2;
 let saveTimer = null;
+let layoutNeedsMigration = false;
+let markdownNeedsMigration = false;
 
 function saveState() {
   try {
@@ -2873,6 +3269,8 @@ function saveState() {
     if (editor) markdownText = editor.value;
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       version: 2,
+      layoutVersion: LAYOUT_VERSION,
+      markdownFormatVersion: MARKDOWN_FORMAT_VERSION,
       root: mindmap.root,
       links: mindmap.links,
       markdownText,
@@ -2898,6 +3296,8 @@ function loadState() {
     const m = MindMap.fromJSON(data.root, data.links);
     if (!m) return false;
     mindmap = m;
+    layoutNeedsMigration = data.layoutVersion !== LAYOUT_VERSION;
+    markdownNeedsMigration = data.markdownFormatVersion !== MARKDOWN_FORMAT_VERSION;
     if (data.viewport) {
       viewport.x = Number.isFinite(data.viewport.x) ? data.viewport.x : viewport.x;
       viewport.y = Number.isFinite(data.viewport.y) ? data.viewport.y : viewport.y;
@@ -3019,6 +3419,7 @@ function setupToolbar() {
   $('#btn-export-json').addEventListener('click', () => {
     const data = {
       version: 2,
+      markdownFormatVersion: MARKDOWN_FORMAT_VERSION,
       exportedAt: new Date().toISOString(),
       root: mindmap.root,
       links: mindmap.links,
@@ -3090,12 +3491,13 @@ function openMarkdownFile(file) {
   if (!confirmDocumentReplacement('打开 Markdown')) return;
   file.text().then((text) => {
     setActiveMode('split');
-    const result = parseMarkdown(text);
+    const normalized = normalizeMarkdown(text);
+    const result = parseMarkdown(normalized.text);
     if (!result.valid) {
       markdownText = text;
       clearMarkdownLineMaps();
       updateMarkdownEditorValue(text);
-      renderMarkdownDiagnostics(result.diagnostics);
+      renderMarkdownDiagnostics(parseMarkdown(text).diagnostics);
       $('#welcome')?.remove();
       saveState();
       showToast('Markdown 存在无法识别的内容');
@@ -3133,6 +3535,16 @@ function openJsonFile(file) {
     mindmap = nextMap;
     selectedId = null;
     finishMapChange('打开 JSON', before);
+    const savedMarkdown = typeof data.markdownText === 'string' ? data.markdownText : '';
+    markdownNeedsMigration = Boolean(savedMarkdown.trim())
+      && data.markdownFormatVersion !== MARKDOWN_FORMAT_VERSION;
+    if (savedMarkdown.trim()) {
+      restoreSavedMarkdownDraft(savedMarkdown);
+      render();
+      saveState();
+    } else {
+      markdownNeedsMigration = false;
+    }
     viewport.fitToContent(mindmap);
     setActiveMode('map');
     showToast('已打开 JSON 备份');
@@ -3191,7 +3603,7 @@ function showWelcome() {
 }
 
 /* ============== 启动 ============== */
-function init() {
+export function init() {
   setupEvents();
   setupToolbar();
 
@@ -3220,10 +3632,4 @@ function init() {
 
   // 离开页面前保存
   window.addEventListener('beforeunload', saveState);
-}
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
-} else {
-  init();
 }
