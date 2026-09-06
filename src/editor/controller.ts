@@ -1988,9 +1988,29 @@ function scheduleMinimapRender() {
 function updateStatus() {
   const zoomEl = $('#zoom-info');
   const nodeEl = $('#node-info');
+  const zoomValueEl = $('#zoom-value');
+  const nodeCountEl = $('#node-count-value');
+  const linkCountEl = $('#link-count-value');
   const statusEl = $('#status-info');
+  const documentNameEl = $('#document-name');
+  const canvasDocumentNameEl = $('#canvas-document-name');
+  const selectedNodeEl = $('#selected-node-label');
+  const selectedNodeMetaEl = $('#selected-node-meta');
   if (zoomEl) zoomEl.textContent = Math.round(viewport.scale * 100) + '%';
-  if (nodeEl) nodeEl.textContent = mindmap.count() + ' 个节点';
+  if (nodeEl) nodeEl.textContent = mindmap.count() + ' 个';
+  if (zoomValueEl) zoomValueEl.textContent = Math.round(viewport.scale * 100) + '%';
+  if (nodeCountEl) nodeCountEl.textContent = String(mindmap.count());
+  if (linkCountEl) linkCountEl.textContent = String(mindmap.links.length);
+  const documentName = normalizedNodeText(mindmap.root.text) || '未命名脑图';
+  if (documentNameEl) documentNameEl.textContent = documentName;
+  if (canvasDocumentNameEl) canvasDocumentNameEl.textContent = documentName;
+  if (selectedNodeEl && selectedNodeMetaEl) {
+    const selectedNode = selectedId ? mindmap.nodes.get(selectedId) : null;
+    selectedNodeEl.textContent = selectedNode ? (selectedNode.text || '空节点') : '未选择节点';
+    selectedNodeMetaEl.textContent = selectedNode
+      ? mindmap.getDepth(selectedNode.id) + ' 层 · ' + selectedNode.children.length + ' 个直接子节点'
+      : '单击节点查看上下文';
+  }
   if (statusEl) {
     statusEl.textContent = markdownStatusType === 'error'
       ? `Markdown ${markdownStatusMessage}`
@@ -2280,6 +2300,12 @@ function setCrossDragHint() {
   if (label) label.textContent = '松开鼠标挂到目标节点下';
 }
 
+function clearCrossDrag() {
+  crossDrag = null;
+  $('#drag-hint')?.classList.add('hidden');
+  $$('.node.hover-target').forEach((node) => node.classList.remove('hover-target'));
+}
+
 function handleToolAction(action, id) {
   const node = mindmap.nodes.get(id);
   if (!node) return;
@@ -2467,6 +2493,7 @@ function setupEvents() {
   // 触屏双指 pinch 缩放
   let lastPinchDist = 0;
   vp.addEventListener('touchstart', (e) => {
+    e.preventDefault();
     if (e.touches.length === 2) {
       lastPinchDist = Math.hypot(
         e.touches[0].clientX - e.touches[1].clientX,
@@ -2500,7 +2527,7 @@ function setupEvents() {
         deselectAll();
       }
     }
-  }, { passive: true });
+  }, { passive: false });
   vp.addEventListener('touchmove', (e) => {
     if (e.touches.length === 2) {
       e.preventDefault();
@@ -2582,6 +2609,23 @@ function setupEvents() {
       vp.classList.remove('panning');
     }
   };
+
+  const cancelActiveGesture = () => {
+    if (linkDrag) {
+      finishLinkDrag(linkDrag.currentX, linkDrag.currentY, true);
+    }
+    finishTouchGesture(true);
+    clearCrossDrag();
+    spaceHeld = false;
+    spacePanned = false;
+    vp.classList.remove('space-held');
+  };
+
+  // 鼠标松开在浏览器窗口外时页面收不到 mouseup，必须主动清理拖动状态。
+  window.addEventListener('blur', cancelActiveGesture);
+  window.addEventListener('mouseleave', (e) => {
+    if (e.relatedTarget === null) cancelActiveGesture();
+  });
 
   window.addEventListener('touchmove', (e) => {
     if (e.touches.length !== 1) {
@@ -2723,12 +2767,11 @@ function setupEvents() {
     if (crossDrag) {
       const drag = crossDrag;
       const targetEl = document.elementFromPoint(drag.currentX, drag.currentY)?.closest('.node');
-      if (targetEl && targetEl.dataset.id !== crossDrag.sourceId) {
+      const canReparent = targetEl && targetEl.dataset.id !== drag.sourceId;
+      clearCrossDrag();
+      if (canReparent) {
         reparent(drag.sourceId, targetEl.dataset.id);
       }
-      crossDrag = null;
-      $('#drag-hint').classList.add('hidden');
-      $$('.node.hover-target').forEach((n) => n.classList.remove('hover-target'));
     }
   });
 
@@ -2831,6 +2874,8 @@ function setupEvents() {
 
   nodesEl.addEventListener('touchstart', (e) => {
     if (e.touches.length !== 1 || editing) return;
+    // 禁止触屏产生后续兼容 mouse 事件，避免一次触摸同时进入两套拖动状态机。
+    e.preventDefault();
     if (pendingNodeCreation) {
       closeNodePicker();
       return;
@@ -2996,6 +3041,8 @@ function setupEvents() {
       } else if (pendingNodeDrag) {
         pendingNodeDrag = null;
         dragStartSnapshot = null;
+      } else if (crossDrag) {
+        clearCrossDrag();
       } else {
         deselectAll();
         hideContextMenu();
@@ -3008,8 +3055,7 @@ function setupEvents() {
     // Ctrl/Cmd + B 切换侧栏
     if ((e.ctrlKey || e.metaKey) && (e.key === 'b' || e.key === 'B')) {
       e.preventDefault();
-      const sidebar = $('#sidebar');
-      if (sidebar) sidebar.style.display = sidebar.style.display === 'none' ? '' : 'none';
+      window.dispatchEvent(new CustomEvent('mindmap:toggle-sidebar'));
       return;
     }
   });
@@ -3279,6 +3325,11 @@ function saveState() {
       viewport: { x: viewport.x, y: viewport.y, scale: viewport.scale },
       theme: document.documentElement.getAttribute('data-theme') || 'light',
     }));
+    const saveStateEl = $('#save-state');
+    if (saveStateEl) {
+      saveStateEl.textContent = '本地已保存';
+      saveStateEl.dataset.state = 'saved';
+    }
   } catch (e) { /* ignore quota */ }
 }
 
@@ -3370,12 +3421,34 @@ function setupToolbar() {
     e.target.value = '';
   });
 
+  window.addEventListener('mindmap:load-example', (event) => {
+    const key = event.detail;
+    const example = EXAMPLES[key];
+    if (!example || !confirmDocumentReplacement('载入示例')) return;
+    setActiveMode('split');
+    const applied = applyMarkdownText(example, {
+      forceLayout: true,
+      preservePrevious: false,
+      label: '载入示例',
+      coalesce: false,
+    });
+    if (!applied) return;
+    $('#welcome')?.remove();
+    viewport.fitToContent(mindmap);
+    showToast('已载入示例：' + key);
+  });
+
   const editor = $('#markdown-editor');
   if (editor) {
     editor.addEventListener('input', () => {
       markdownText = editor.value;
       updateMarkdownGutter();
       setMarkdownStatus('输入中…', 'pending');
+      const saveStateEl = $('#save-state');
+      if (saveStateEl) {
+        saveStateEl.textContent = '等待保存';
+        saveStateEl.dataset.state = 'pending';
+      }
       clearTimeout(markdownParseTimer);
       markdownParseTimer = setTimeout(() => applyMarkdownDraft({
         label: '编辑 Markdown',
@@ -3440,6 +3513,7 @@ function setupToolbar() {
     mindmap = new MindMap();
     selectedId = null;
     finishMapChange('清空脑图', before);
+    setActiveMode('map');
     viewport.fitToContent(mindmap);
     showToast('已清空，可使用撤销恢复');
     showWelcome();
@@ -3570,22 +3644,34 @@ function showWelcome() {
   welcome.id = 'welcome';
   welcome.className = 'welcome';
   welcome.innerHTML = `
-    <div class="welcome-card">
-      <div class="welcome-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="3"/>
-          <circle cx="4" cy="6" r="2"/>
-          <circle cx="4" cy="18" r="2"/>
-          <circle cx="20" cy="6" r="2"/>
-          <circle cx="20" cy="18" r="2"/>
-          <path d="M12 12 L4 6 M12 12 L4 18 M12 12 L20 6 M12 12 L20 18"/>
-        </svg>
+    <div class="welcome-shell">
+      <div class="welcome-main">
+        <h1 class="welcome-title">把想法写下来，<br><span>让结构找到方向。</span></h1>
+        <p class="welcome-sub">从一个主题开始，在画布和 Markdown 之间切换。每次修改都可恢复，内容始终留在你的浏览器里。</p>
+        <div class="welcome-trust">PRIVATE <i></i> LOCAL <i></i> RECOVERABLE</div>
+        <div class="welcome-actions">
+          <button class="welcome-btn" data-action="import">编辑 Markdown <span>→</span></button>
+          <button class="welcome-btn ghost" data-action="start">从空白开始</button>
+        </div>
+        <div class="welcome-templates">
+          <span class="welcome-template-label">从一个模板开始</span>
+          <button class="welcome-template" type="button" data-action="example" data-example="project">产品开发</button>
+          <button class="welcome-template" type="button" data-action="example" data-example="learning">学习路径</button>
+          <button class="welcome-template" type="button" data-action="example" data-example="book">读书笔记</button>
+        </div>
       </div>
-      <div class="welcome-title">脑图编辑器</div>
-       <div class="welcome-sub">从一个主题开始，脑图和 Markdown 会保持同步。</div>
-       <div class="welcome-actions">
-         <button class="welcome-btn" data-action="import">编辑 Markdown</button>
-         <button class="welcome-btn ghost" data-action="start">从空白开始</button>
+      <div class="welcome-visual" aria-hidden="true">
+        <span class="storm-caption">WORD / WEATHER</span>
+        <span class="storm-word storm-word-main">IDEA</span>
+        <span class="storm-word storm-word-branch">STRUCTURE</span>
+        <span class="storm-word storm-word-flow">FLOW →</span>
+        <svg class="storm-lines" viewBox="0 0 360 360" fill="none">
+          <path d="M54 192C110 192 112 128 168 128S220 180 286 180" />
+          <path d="M122 250C174 250 178 214 224 214s36 26 82 26" />
+          <circle cx="54" cy="192" r="4" /><circle cx="168" cy="128" r="5" /><circle cx="286" cy="180" r="4" />
+        </svg>
+        <span class="storm-silver"></span>
+        <span class="storm-footnote">文字 · 空间 · 连线</span>
       </div>
     </div>
   `;
@@ -3599,6 +3685,13 @@ function showWelcome() {
   welcome.querySelector('[data-action="start"]').addEventListener('click', () => {
     welcome.remove();
     editNode(mindmap.root.id);
+  });
+  welcome.querySelectorAll('[data-action="example"]').forEach((button) => {
+    button.addEventListener('click', () => {
+      window.dispatchEvent(new CustomEvent('mindmap:load-example', {
+        detail: button.dataset.example,
+      }));
+    });
   });
 }
 
@@ -3616,7 +3709,10 @@ export function init() {
     restoreSavedMarkdownDraft(savedMarkdown);
     viewport.apply();
     render();
-    if (!hasDocumentContent()) showWelcome();
+    if (!hasDocumentContent()) {
+      setActiveMode('map', false);
+      showWelcome();
+    }
   } else {
     // 首次打开保持真正的空白状态，示例内容不再强制载入。
     mindmap = new MindMap();
