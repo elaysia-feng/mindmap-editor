@@ -29,7 +29,7 @@ const emit = defineEmits<{
           <span class="document-label">当前脑图</span>
           <strong id="document-name">未命名脑图</strong>
         </div>
-        <span id="save-state" class="save-state" data-state="saved">本地已保存</span>
+        <span role="status" aria-live="polite" id="save-state" class="save-state" data-state="saved">本地已保存</span>
       </div>
     </div>
 

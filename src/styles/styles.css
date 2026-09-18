@@ -3045,3 +3045,11 @@ body.sidebar-closed .welcome {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Saving errors must remain visible, including on narrow screens. */
+.save-state[data-state="error"] { color: #b42318; display: inline-flex; }
+[data-theme="dark"] .save-state[data-state="error"] { color: #ffaca5; }
+.node-text[contenteditable="true"] { touch-action: auto; user-select: text; -webkit-user-select: text; }
+@media (pointer: coarse) {
+  .node-toolbar button { min-width: 44px; min-height: 44px; }
+}

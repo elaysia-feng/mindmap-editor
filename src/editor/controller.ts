@@ -9,12 +9,18 @@
 
 'use strict';
 
+let eventController = new AbortController();
+const listen = (target, type, handler, options = {}) => target.addEventListener(type, handler, {
+  ...(typeof options === 'boolean' ? { capture: options } : options),
+  signal: eventController.signal,
+});
+
 /* ============== 工具函数 ============== */
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => root.querySelectorAll(sel);
-const uid = () => 'n' + Math.random().toString(36).slice(2, 10);
+import { uid, SAFE_ID, normalizeRoot, matchChildren, writeDocument, MAX_FILE_BYTES } from './document';
 // 可以安全地拼进 CSS 属性选择器的 id 形状。
-const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const isEditableTarget = (target) => Boolean(
   target?.closest?.('input, textarea, select, [contenteditable="true"]')
@@ -36,25 +42,25 @@ function setMarkdownSyntax(node, kind, level = 0, indent = 0, marker = '-') {
     value: kind,
     writable: true,
     configurable: true,
-    enumerable: false,
+    enumerable: true,
   });
   Object.defineProperty(node, '__markdownLevel', {
     value: level,
     writable: true,
     configurable: true,
-    enumerable: false,
+    enumerable: true,
   });
   Object.defineProperty(node, '__markdownIndent', {
     value: indent,
     writable: true,
     configurable: true,
-    enumerable: false,
+    enumerable: true,
   });
   Object.defineProperty(node, '__markdownMarker', {
     value: marker,
     writable: true,
     configurable: true,
-    enumerable: false,
+    enumerable: true,
   });
   return node;
 }
@@ -99,7 +105,7 @@ class MindMap {
       const originalId = n.id;
       if (typeof n.id !== 'string' || !SAFE_ID.test(n.id) || this.nodes.has(n.id)) {
         const safe = uid();
-        if (originalId !== undefined && originalId !== null && !remapped.has(originalId)) {
+        if (originalId !== undefined && originalId !== null && !remapped.has(originalId) && !this.nodes.has(originalId)) {
           remapped.set(originalId, safe);
         }
         n.id = safe;
@@ -111,20 +117,27 @@ class MindMap {
     walk(this.root);
     const normalizedLinks = [];
     const seenLinks = new Set();
-    (Array.isArray(this.links) ? this.links : []).forEach((link) => {
+    const linkIds = new Set();
+    const importedLinks = this.links;
+    this.links = [];
+    (Array.isArray(importedLinks) ? importedLinks : []).forEach((link) => {
       const from = remapped.get(link?.from) || link?.from;
       const to = remapped.get(link?.to) || link?.to;
       if (!from || !to || from === to || !this.nodes.has(from) || !this.nodes.has(to)) return;
       const key = `${from}->${to}`;
       if (seenLinks.has(key)) return;
       seenLinks.add(key);
+      if (this.parents.get(to)?.id === from || this.hasPath(to, from)) return;
+      const id = typeof link.id === 'string' && SAFE_ID.test(link.id) && !linkIds.has(link.id) ? link.id : uid();
+      linkIds.add(id);
       normalizedLinks.push({
-        id: link.id || uid(),
+        id,
         from,
         to,
         sourcePort: link.sourcePort || link.source_port || 'output',
         targetPort: link.targetPort || link.target_port || 'input',
       });
+      this.links = normalizedLinks;
     });
     this.links = normalizedLinks;
     this.refreshCollapsedCache();
@@ -298,9 +311,9 @@ class MindMap {
   static fromJSON(json, links) {
     try {
       const data = typeof json === 'string' ? JSON.parse(json) : json;
-      const root = data?.root && Array.isArray(data.root.children) ? data.root : data;
+      const root = data?.root ?? data;
       const linkData = Array.isArray(links) ? links : data?.links;
-      return new MindMap(root, linkData);
+      return new MindMap(normalizeRoot(root), linkData);
     } catch (e) {
       return null;
     }
@@ -532,6 +545,9 @@ function parseMarkdown(text) {
   }
 
   const lines = text.split(/\r?\n/);
+  if (lines.length > 5000 || text.length > MAX_FILE_BYTES) {
+    return { root, valid: false, diagnostics: [{ message: 'Markdown 超过 5000 行或 5 MB，请拆分文档', severity: 'error' }] };
+  }
   const stack = [{ node: root, level: 0 }];
   let firstHeadingDone = false;
   let hasAnyContent = false;
@@ -982,6 +998,13 @@ let markdownLastValidText = '';
 let markdownNodeLines = new Map();
 let markdownLineNodes = new Map();
 let markdownParseTimer = null;
+let markdownComposing = false;
+function flushMarkdownDraft() {
+  if (markdownParseTimer === null || markdownComposing) return;
+  clearTimeout(markdownParseTimer);
+  markdownParseTimer = null;
+  applyMarkdownDraft({ coalesce: false });
+}
 let markdownSyncing = false;
 let markdownStatusMessage = '已同步';
 let markdownStatusType = 'synced';
@@ -1047,6 +1070,8 @@ function cloneLinks(links) {
 
 function captureSnapshot() {
   return {
+    markdownText,
+    markdownLastValidText,
     root: cloneRoot(mindmap.root),
     links: cloneLinks(mindmap.links),
     selectedId,
@@ -1066,7 +1091,7 @@ let lastHistoryAt = 0;
 
 function recordHistory(label, before, coalesce = false) {
   const after = mindmap.root;
-  if (rootsEqual(before.root, after) && linksEqual(before.links, mindmap.links)) return false;
+  if (rootsEqual(before.root, after) && linksEqual(before.links, mindmap.links) && before.markdownText === markdownText) return false;
 
   const now = Date.now();
   const last = undoStack[undoStack.length - 1];
@@ -1113,12 +1138,22 @@ function restoreSnapshot(snapshot) {
     ? snapshot.selectedLinkId
     : null;
   syncMarkdownFromMap();
+  if (typeof snapshot.markdownText === 'string') {
+    markdownText = snapshot.markdownText;
+    markdownLastValidText = snapshot.markdownLastValidText;
+    updateMarkdownEditorValue(markdownText);
+    const parsed = parseMarkdown(normalizeMarkdown(markdownText).text);
+    renderMarkdownDiagnostics(parsed.diagnostics);
+    if (!parsed.valid) clearMarkdownLineMaps();
+    else reconcileParsedTree(parsed.root, mindmap.root);
+  }
   render();
   saveState();
   if (hasDocumentContent()) $('#welcome')?.remove();
 }
 
 function undo() {
+  flushMarkdownDraft();
   commitActiveEdit();
   const item = undoStack.pop();
   if (!item) return;
@@ -1129,6 +1164,7 @@ function undo() {
 }
 
 function redo() {
+  flushMarkdownDraft();
   commitActiveEdit();
   const item = redoStack.pop();
   if (!item) return;
@@ -1295,19 +1331,10 @@ function reconcileNode(parsed, previous, parent = null, index = 0, preservePrevi
   }
 
   const oldChildren = previous?.children || [];
-  const used = new Set();
-  node.children = parsed.children.map((child, childIndex) => {
-    const text = normalizedNodeText(child.text);
-    let matchIndex = oldChildren.findIndex((oldChild, oldIndex) => (
-      !used.has(oldIndex) && normalizedNodeText(oldChild.text) === text
-    ));
-    if (matchIndex < 0 && oldChildren[childIndex] && !used.has(childIndex)) {
-      matchIndex = childIndex;
-    }
-    const match = matchIndex >= 0 ? oldChildren[matchIndex] : null;
-    if (matchIndex >= 0) used.add(matchIndex);
-    return reconcileNode(child, match, node, childIndex, preservePrevious);
-  });
+  const matches = preservePrevious ? matchChildren(parsed.children, oldChildren) : [];
+  node.children = parsed.children.map((child, childIndex) => (
+    reconcileNode(child, matches[childIndex], node, childIndex, preservePrevious)
+  ));
   return node;
 }
 
@@ -1324,6 +1351,7 @@ function applyMarkdownText(value, options = {}) {
   const selection = editor && document.activeElement === editor
     ? { start: editor.selectionStart, end: editor.selectionEnd }
     : null;
+  const before = captureSnapshot();
   const normalized = normalizeMarkdown(value, selection);
   const parsed = parseMarkdown(normalized.text);
   const diagnostics = [...parsed.diagnostics];
@@ -1338,13 +1366,13 @@ function applyMarkdownText(value, options = {}) {
   renderMarkdownDiagnostics(diagnostics);
   if (!parsed.valid) {
     clearMarkdownLineMaps();
+    recordHistory(options.label || '编辑 Markdown', before, options.coalesce !== false);
     saveState();
     return false;
   }
 
   markdownNeedsMigration = false;
 
-  const before = captureSnapshot();
   const shouldAutoLayout = options.forceLayout
     || options.preservePrevious === false
     || mindmap.root.children.length === 0
@@ -1485,6 +1513,7 @@ function setActiveMode(mode, persist = true) {
   if (!['map', 'markdown', 'split'].includes(mode)) mode = 'map';
   if (mode === 'split' && window.innerWidth <= 768) mode = 'markdown';
   // 切换工作区前先提交画布内的 contenteditable，避免隐藏编辑框后状态悬挂。
+  if (persist) flushMarkdownDraft();
   commitActiveEdit();
   const previousRect = getCanvasRect();
   const worldCenterX = (previousRect.width / 2 - viewport.x) / viewport.scale;
@@ -2473,6 +2502,7 @@ function setupEvents() {
   nodePicker?.addEventListener('mousedown', (e) => e.stopPropagation());
   nodePicker?.addEventListener('click', (e) => e.stopPropagation());
   nodePickerInput?.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') {
       e.preventDefault();
       createPendingNode();
@@ -2484,7 +2514,7 @@ function setupEvents() {
   });
 
   // 滚轮缩放
-  vp.addEventListener('wheel', (e) => {
+  listen(vp, 'wheel', (e) => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
     viewport.zoomAt(factor, e.clientX, e.clientY);
@@ -2492,7 +2522,8 @@ function setupEvents() {
 
   // 触屏双指 pinch 缩放
   let lastPinchDist = 0;
-  vp.addEventListener('touchstart', (e) => {
+  listen(vp, 'touchstart', (e) => {
+    if (isEditableTarget(e.target)) return;
     e.preventDefault();
     if (e.touches.length === 2) {
       lastPinchDist = Math.hypot(
@@ -2528,7 +2559,7 @@ function setupEvents() {
       }
     }
   }, { passive: false });
-  vp.addEventListener('touchmove', (e) => {
+  listen(vp, 'touchmove', (e) => {
     if (e.touches.length === 2) {
       e.preventDefault();
       const dist = Math.hypot(
@@ -2544,10 +2575,10 @@ function setupEvents() {
       lastPinchDist = dist;
     }
   }, { passive: false });
-  vp.addEventListener('touchend', () => { lastPinchDist = 0; }, { passive: true });
+  listen(vp, 'touchend', () => { lastPinchDist = 0; }, { passive: true });
 
   // 画布按下 - 平移或双击新建
-  vp.addEventListener('mousedown', (e) => {
+  listen(vp, 'mousedown', (e) => {
     const isOnEmpty = !e.target.closest?.('.node, .node-toolbar, .context-menu');
     if (!isOnEmpty) return;
 
@@ -2622,12 +2653,12 @@ function setupEvents() {
   };
 
   // 鼠标松开在浏览器窗口外时页面收不到 mouseup，必须主动清理拖动状态。
-  window.addEventListener('blur', cancelActiveGesture);
-  window.addEventListener('mouseleave', (e) => {
+  listen(window, 'blur', cancelActiveGesture);
+  listen(window, 'mouseleave', (e) => {
     if (e.relatedTarget === null) cancelActiveGesture();
   });
 
-  window.addEventListener('touchmove', (e) => {
+  listen(window, 'touchmove', (e) => {
     if (e.touches.length !== 1) {
       if (linkDrag) finishLinkDrag(0, 0, true);
       else finishTouchGesture(true);
@@ -2674,7 +2705,7 @@ function setupEvents() {
     }
   }, { passive: false });
 
-  window.addEventListener('touchend', (e) => {
+  listen(window, 'touchend', (e) => {
     if (linkDrag && e.touches.length === 0) {
       const touch = e.changedTouches?.[0];
       finishLinkDrag(touch?.clientX || linkDrag.currentX, touch?.clientY || linkDrag.currentY);
@@ -2682,12 +2713,12 @@ function setupEvents() {
       finishTouchGesture(false);
     }
   }, { passive: true });
-  window.addEventListener('touchcancel', () => {
+  listen(window, 'touchcancel', () => {
     if (linkDrag) finishLinkDrag(0, 0, true);
     else finishTouchGesture(true);
   }, { passive: true });
 
-  window.addEventListener('mousemove', (e) => {
+  listen(window, 'mousemove', (e) => {
     if (linkDrag) {
       updateLinkDrag(e.clientX, e.clientY);
       return;
@@ -2738,7 +2769,7 @@ function setupEvents() {
   });
 
   // 鼠标松开
-  window.addEventListener('mouseup', (e) => {
+  listen(window, 'mouseup', (e) => {
     if (linkDrag) {
       finishLinkDrag(e.clientX, e.clientY);
       return;
@@ -2776,7 +2807,7 @@ function setupEvents() {
   });
 
   // 双击空白处 - 创建根的子节点
-  vp.addEventListener('dblclick', (e) => {
+  listen(vp, 'dblclick', (e) => {
     const isOnEmpty = !e.target.closest?.('.node, .node-toolbar, .context-menu');
     if (!isOnEmpty) return;
     const rect = getCanvasRect();
@@ -2790,7 +2821,7 @@ function setupEvents() {
   const connectionsEl = $('#connections');
 
   // Coze/FlowGram 风格：连线自身也是可选中的对象，选中后按 Delete 删除。
-  connectionsEl.addEventListener('mousedown', (e) => {
+  listen(connectionsEl, 'mousedown', (e) => {
     const path = e.target.closest?.('.connection.free');
     if (!path) return;
     e.preventDefault();
@@ -2800,7 +2831,7 @@ function setupEvents() {
     renderSelectionOnly();
   });
 
-  nodesEl.addEventListener('mousedown', (e) => {
+  listen(nodesEl, 'mousedown', (e) => {
     if (e.button !== 0) return;
     if (pendingNodeCreation) {
       closeNodePicker();
@@ -2872,7 +2903,7 @@ function setupEvents() {
     updateNodeToolbar();
   });
 
-  nodesEl.addEventListener('touchstart', (e) => {
+  listen(nodesEl, 'touchstart', (e) => {
     if (e.touches.length !== 1 || editing) return;
     // 禁止触屏产生后续兼容 mouse 事件，避免一次触摸同时进入两套拖动状态机。
     e.preventDefault();
@@ -2931,14 +2962,14 @@ function setupEvents() {
     updateNodeToolbar();
   }, { passive: false });
 
-  nodesEl.addEventListener('dblclick', (e) => {
+  listen(nodesEl, 'dblclick', (e) => {
     const nodeEl = e.target.closest('.node');
     if (!nodeEl) return;
     e.stopPropagation();
     editNode(nodeEl.dataset.id);
   });
 
-  nodesEl.addEventListener('contextmenu', (e) => {
+  listen(nodesEl, 'contextmenu', (e) => {
     const nodeEl = e.target.closest('.node');
     if (!nodeEl) return;
     e.preventDefault();
@@ -2947,7 +2978,9 @@ function setupEvents() {
   });
 
   // 键盘
-  window.addEventListener('keydown', (e) => {
+  listen(window, 'keydown', (e) => {
+    if (e.defaultPrevented || e.isComposing || document.querySelector('.overlay-layer')) return;
+    if (e.target.closest?.('button, a, summary, [role="dialog"]')) return;
     if (editing) {
       // 编辑中：Esc / Enter 由编辑框处理
       return;
@@ -3060,28 +3093,29 @@ function setupEvents() {
     }
   });
 
-  window.addEventListener('keyup', (e) => {
+  listen(window, 'keyup', (e) => {
     if (e.code !== 'Space') return;
+    const wasHeld = spaceHeld;
     const panned = spacePanned;
     spaceHeld = false;
     spacePanned = false;
     vp.classList.remove('space-held');
     // Space 兼作折叠快捷键和平移修饰键：只有没真的平移过才当成折叠，
     // 否则每次 Space+拖拽都会先把选中节点折叠掉。
-    if (!panned && !editing && selectedId && !isEditableTarget(e.target)) {
+    if (wasHeld && !document.querySelector('.overlay-layer') && !panned && !editing && selectedId && !isEditableTarget(e.target)) {
       handleToolAction('collapse', selectedId);
     }
   });
 
   // 点击空白处关闭右键菜单
-  window.addEventListener('click', (e) => {
+  listen(window, 'click', (e) => {
     if (!e.target.closest('.context-menu')) {
       hideContextMenu();
     }
   });
 
   // 窗口大小
-  window.addEventListener('resize', () => {
+  listen(window, 'resize', () => {
     viewport.apply();
     renderMinimap();
   });
@@ -3252,6 +3286,7 @@ function editNode(id) {
   const onBlur = () => finish(true);
   const onKey = (e) => {
     e.stopPropagation();
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       textEl.blur();
@@ -3308,29 +3343,38 @@ const MARKDOWN_FORMAT_VERSION = 2;
 let saveTimer = null;
 let layoutNeedsMigration = false;
 let markdownNeedsMigration = false;
+let storageRecoveryBlocked = false;
 
 function saveState() {
   try {
+    if (storageRecoveryBlocked) throw new Error('Unrecoverable storage');
     const editor = $('#markdown-editor');
-    if (editor) markdownText = editor.value;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    const saved = writeDocument(localStorage, STORAGE_KEY, {
       version: 2,
       layoutVersion: LAYOUT_VERSION,
       markdownFormatVersion: MARKDOWN_FORMAT_VERSION,
       root: mindmap.root,
       links: mindmap.links,
-      markdownText,
+      markdownText: editor?.value ?? markdownText,
       markdownLastValidText,
       mode: activeMode,
       viewport: { x: viewport.x, y: viewport.y, scale: viewport.scale },
       theme: document.documentElement.getAttribute('data-theme') || 'light',
-    }));
+    });
+    if (!saved) throw new Error('Storage unavailable');
     const saveStateEl = $('#save-state');
     if (saveStateEl) {
       saveStateEl.textContent = '本地已保存';
       saveStateEl.dataset.state = 'saved';
     }
-  } catch (e) { /* ignore quota */ }
+  } catch (e) {
+    const status = $('#save-state');
+    if (status) {
+      status.textContent = '保存失败，请导出备份';
+      status.dataset.state = 'error';
+      status.title = '浏览器存储不可用或空间不足，请导出 JSON 备份';
+    }
+  }
 }
 
 function saveStateThrottled() {
@@ -3339,13 +3383,14 @@ function saveStateThrottled() {
 }
 
 function loadState() {
+  let raw;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+    raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
     if (!raw) return false;
     const data = JSON.parse(raw);
-    if (!data.root) return false;
+    if (!data?.root) throw new Error('Invalid saved root');
     const m = MindMap.fromJSON(data.root, data.links);
-    if (!m) return false;
+    if (!m) throw new Error('Invalid saved document');
     mindmap = m;
     layoutNeedsMigration = data.layoutVersion !== LAYOUT_VERSION;
     markdownNeedsMigration = data.markdownFormatVersion !== MARKDOWN_FORMAT_VERSION;
@@ -3354,7 +3399,7 @@ function loadState() {
       viewport.y = Number.isFinite(data.viewport.y) ? data.viewport.y : viewport.y;
       viewport.scale = clamp(Number(data.viewport.scale) || 1, viewport.minScale, viewport.maxScale);
     }
-    if (data.theme) document.documentElement.setAttribute('data-theme', data.theme);
+    if (['light', 'dark'].includes(data.theme)) document.documentElement.setAttribute('data-theme', data.theme);
     if (['map', 'markdown', 'split'].includes(data.mode)) activeMode = data.mode;
     const generated = mindmap.toMarkdown();
     markdownText = typeof data.markdownText === 'string' ? data.markdownText : generated;
@@ -3363,6 +3408,11 @@ function loadState() {
       : generated;
     return true;
   } catch (e) {
+    if (raw) {
+      try { localStorage.setItem(STORAGE_KEY + '-recovery-' + Date.now(), raw); }
+      catch { storageRecoveryBlocked = true; }
+      setTimeout(() => showToast('本地文档损坏，原始内容已保留，请导入备份恢复', 'error'), 100);
+    }
     return false;
   }
 }
@@ -3384,7 +3434,8 @@ function showToast(msg, type = '') {
 /* ============== 工具栏 ============== */
 function setupToolbar() {
   $('#btn-add-root').addEventListener('click', () => {
-    addChildNode(mindmap.root.id);
+    flushMarkdownDraft();
+    addChildNode(selectedId || mindmap.root.id);
   });
   $('#btn-auto-layout').addEventListener('click', () => {
     commitActiveEdit();
@@ -3421,7 +3472,7 @@ function setupToolbar() {
     e.target.value = '';
   });
 
-  window.addEventListener('mindmap:load-example', (event) => {
+  listen(window, 'mindmap:load-example', (event) => {
     const key = event.detail;
     const example = EXAMPLES[key];
     if (!example || !confirmDocumentReplacement('载入示例')) return;
@@ -3440,8 +3491,7 @@ function setupToolbar() {
 
   const editor = $('#markdown-editor');
   if (editor) {
-    editor.addEventListener('input', () => {
-      markdownText = editor.value;
+    const queueMarkdown = () => {
       updateMarkdownGutter();
       setMarkdownStatus('输入中…', 'pending');
       const saveStateEl = $('#save-state');
@@ -3450,19 +3500,24 @@ function setupToolbar() {
         saveStateEl.dataset.state = 'pending';
       }
       clearTimeout(markdownParseTimer);
-      markdownParseTimer = setTimeout(() => applyMarkdownDraft({
-        label: '编辑 Markdown',
-        coalesce: true,
-      }), 300);
-    });
-    editor.addEventListener('click', selectNodeFromMarkdownCursor);
-    editor.addEventListener('keyup', selectNodeFromMarkdownCursor);
-    editor.addEventListener('select', selectNodeFromMarkdownCursor);
-    editor.addEventListener('scroll', () => {
+      if (!markdownComposing) markdownParseTimer = setTimeout(() => {
+        markdownParseTimer = null;
+        applyMarkdownDraft({ label: '编辑 Markdown', coalesce: true });
+      }, 300);
+    };
+    listen(editor, 'input', queueMarkdown);
+    listen(editor, 'compositionstart', () => { markdownComposing = true; clearTimeout(markdownParseTimer); });
+    listen(editor, 'compositionend', () => { markdownComposing = false; queueMarkdown(); });
+    listen(editor, 'blur', flushMarkdownDraft);
+    listen(editor, 'click', selectNodeFromMarkdownCursor);
+    listen(editor, 'keyup', selectNodeFromMarkdownCursor);
+    listen(editor, 'select', selectNodeFromMarkdownCursor);
+    listen(editor, 'scroll', () => {
       const gutter = $('#md-gutter');
       if (gutter) gutter.scrollTop = editor.scrollTop;
     });
-    editor.addEventListener('keydown', (e) => {
+    listen(editor, 'keydown', (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         e.preventDefault();
         clearTimeout(markdownParseTimer);
@@ -3490,6 +3545,8 @@ function setupToolbar() {
   });
 
   $('#btn-export-json').addEventListener('click', () => {
+    flushMarkdownDraft();
+    commitActiveEdit();
     const data = {
       version: 2,
       markdownFormatVersion: MARKDOWN_FORMAT_VERSION,
@@ -3504,7 +3561,7 @@ function setupToolbar() {
 
   $('#btn-clear').addEventListener('click', () => {
     commitActiveEdit();
-    if (mindmap.count() === 1 && !mindmap.root.children.length) {
+    if (!hasDocumentContent()) {
       showToast('当前已经是空白脑图');
       return;
     }
@@ -3544,6 +3601,7 @@ function setupToolbar() {
 }
 
 function exportMarkdown() {
+  commitActiveEdit();
   const content = $('#markdown-editor')?.value || markdownText || mindmap.toMarkdown();
   download('mindmap.md', content, 'text/markdown;charset=utf-8');
   showToast('已导出 Markdown');
@@ -3562,6 +3620,7 @@ function confirmDocumentReplacement(action) {
 }
 
 function openMarkdownFile(file) {
+  if (file.size > MAX_FILE_BYTES) { showToast('文件不能超过 5 MB', 'error'); return; }
   if (!confirmDocumentReplacement('打开 Markdown')) return;
   file.text().then((text) => {
     setActiveMode('split');
@@ -3589,6 +3648,7 @@ function openMarkdownFile(file) {
 }
 
 function openJsonFile(file) {
+  if (file.size > MAX_FILE_BYTES) { showToast('文件不能超过 5 MB', 'error'); return; }
   if (!confirmDocumentReplacement('打开 JSON')) return;
   file.text().then((text) => {
     let data;
@@ -3598,8 +3658,8 @@ function openJsonFile(file) {
       showToast('JSON 文件格式错误');
       return;
     }
-    const root = data.root || data;
-    const nextMap = MindMap.fromJSON(root, data.links);
+    const root = data?.root || data;
+    const nextMap = MindMap.fromJSON(root, data?.links);
     if (!nextMap) {
       showToast('JSON 中没有有效脑图');
       return;
@@ -3634,7 +3694,7 @@ function download(filename, content, mime) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /* ============== 欢迎页 ============== */
@@ -3697,6 +3757,8 @@ function showWelcome() {
 
 /* ============== 启动 ============== */
 export function init() {
+  eventController.abort();
+  eventController = new AbortController();
   setupEvents();
   setupToolbar();
 
@@ -3724,8 +3786,19 @@ export function init() {
   }
 
   // 周期自动保存（防止遗漏）
-  setInterval(saveState, 10000);
+  const autosaveTimer = setInterval(saveState, 10000);
 
   // 离开页面前保存
-  window.addEventListener('beforeunload', saveState);
+  const flush = () => { commitActiveEdit(); flushMarkdownDraft(); saveState(); };
+  listen(window, 'beforeunload', flush);
+  listen(window, 'pagehide', flush);
+  listen(document, 'visibilitychange', () => { if (document.hidden) flush(); });
+  return () => {
+    flush();
+    eventController.abort();
+    clearInterval(autosaveTimer);
+    [saveTimer, markdownParseTimer, pendingEditTimer, toastTimer].forEach(clearTimeout);
+    if (minimapRafId) cancelAnimationFrame(minimapRafId);
+    $('#welcome')?.remove();
+  };
 }
