@@ -6,7 +6,7 @@ async function start(page) {
   await page.keyboard.press('Escape');
 }
 async function markdown(page, text) {
-  await page.locator('[data-mode="markdown"]').click();
+  await page.locator('.mode-btn[data-mode="markdown"]').click();
   await page.locator('#markdown-editor').fill(text);
   await page.waitForTimeout(400);
 }
@@ -86,4 +86,22 @@ test('command modal traps focus and prevents map shortcuts; mobile can undo and 
   await expect(page.locator('.node')).toHaveCount(1);
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
+
+test('clearing a renamed root is undoable and damaged storage is preserved', async ({ page }) => {
+  await start(page);
+  await markdown(page, '# Renamed');
+  page.on('dialog', d => d.accept());
+  await command(page, '清空脑图');
+  await expect(page.locator('.node-text')).toHaveText('中心主题');
+  await page.keyboard.press('Escape');
+  await command(page, '撤销');
+  await expect(page.locator('.node-text')).toHaveText('Renamed');
+  await page.evaluate(() => localStorage.setItem('mindmap-studio-v2', '{broken'));
+  // Terminate the document without pagehide resaving over the deliberately corrupted fixture.
+  await page.context().addInitScript(() => localStorage.setItem('mindmap-studio-v2', '{broken'));
+  await page.reload();
+  await expect(page.locator('.node-text')).toHaveText('中心主题');
+  expect(await page.evaluate(() => Object.keys(localStorage).some(key => key.includes('-recovery-') && localStorage.getItem(key) === '{broken'))).toBe(true);
 });

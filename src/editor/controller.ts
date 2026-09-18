@@ -655,6 +655,9 @@ function parseMarkdown(text) {
     root.text = text.split('\n')[0].trim().slice(0, 50) || '中心主题';
   }
 
+  try { normalizeRoot(root); } catch (error) {
+    diagnostics.push({ message: error.message, severity: 'error' });
+  }
   return { root, diagnostics, valid: !diagnostics.some((d) => d.severity === 'error') };
 }
 
@@ -3664,6 +3667,8 @@ function openJsonFile(file) {
       showToast('JSON 中没有有效脑图');
       return;
     }
+    const missingPosition = (node) => !Number.isFinite(node.x) || !Number.isFinite(node.y) || (node.children || []).some(missingPosition);
+    if (missingPosition(root)) autoLayout(nextMap.root);
     commitActiveEdit();
     const before = captureSnapshot();
     mindmap = nextMap;
