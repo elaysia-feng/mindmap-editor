@@ -26,8 +26,13 @@ const selectedCommandIndex = ref(0);
 const commandInput = ref<HTMLInputElement | null>(null);
 
 const commands: Command[] = [
+  { id: 'undo', label: '撤销', description: '恢复上一步修改', shortcut: 'Ctrl Z', group: '编辑' },
+  { id: 'redo', label: '重做', description: '重新应用已撤销的修改', shortcut: 'Ctrl Shift Z', group: '编辑' },
+  { id: 'open-json', label: '打开 JSON 备份', description: '恢复节点、位置与工作流连线', group: '文件' },
+  { id: 'clear', label: '清空脑图', description: '新建空白脑图，可撤销恢复', group: '文件' },
+  { id: 'fit', label: '适配视图', description: '将所有可见节点放入画布', shortcut: 'F', group: '视图' },
   { id: 'new-node', label: '添加一个新节点', description: '从当前选中节点创建子节点', shortcut: 'Tab', group: '编辑' },
-  { id: 'layout', label: '整理当前布局', description: '按层级重新排列整张脑图', shortcut: 'F', group: '编辑' },
+  { id: 'layout', label: '整理当前布局', description: '按层级重新排列整张脑图', group: '编辑' },
   { id: 'map', label: '切换到脑图', description: '回到空间画布视图', group: '视图' },
   { id: 'split', label: '打开分屏视图', description: '同时查看结构与 Markdown', group: '视图' },
   { id: 'markdown', label: '打开 Markdown', description: '用文本快速编辑整张脑图', group: '视图' },
@@ -49,6 +54,22 @@ const filteredCommands = computed(() => {
 
 const activeCommand = computed(() => filteredCommands.value[selectedCommandIndex.value]);
 
+let previousFocus: HTMLElement | null = null;
+watch(() => commandOpen.value || helpOpen.value, async (open) => {
+  if (open) {
+    previousFocus = document.activeElement as HTMLElement;
+    await nextTick();
+    document.querySelector<HTMLElement>('.overlay-layer input, .overlay-layer button')?.focus();
+  } else {
+    await nextTick();
+    if (previousFocus?.isConnected) previousFocus.focus();
+  }
+});
+watch(selectedCommandIndex, async () => {
+  await nextTick();
+  document.querySelector('.command-item.active')?.scrollIntoView({ block: 'nearest' });
+});
+
 watch(commandQuery, () => {
   selectedCommandIndex.value = 0;
 });
@@ -63,6 +84,7 @@ function clickExisting(selector: string) {
 }
 
 function openCommand() {
+  helpOpen.value = false;
   commandOpen.value = true;
   commandQuery.value = '';
   selectedCommandIndex.value = 0;
@@ -111,6 +133,11 @@ function runCommand(command: Command | undefined = activeCommand.value) {
 
   closeCommand();
   switch (command.id) {
+    case 'undo': clickExisting('#btn-undo'); break;
+    case 'redo': clickExisting('#btn-redo'); break;
+    case 'open-json': clickExisting('#btn-open-json'); break;
+    case 'clear': clickExisting('#btn-clear'); break;
+    case 'fit': clickExisting('#fab-fit'); break;
     case 'new-node':
       clickExisting('#btn-add-root');
       break;
@@ -150,6 +177,22 @@ function runCommand(command: Command | undefined = activeCommand.value) {
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return;
+  if (commandOpen.value || helpOpen.value) {
+    event.stopImmediatePropagation();
+    if (event.key === 'Tab') {
+      const dialog = document.querySelector<HTMLElement>('.overlay-layer [role="dialog"]');
+      const controls = Array.from(dialog?.querySelectorAll<HTMLElement>('button, input, [tabindex="0"]') || []);
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !dialog?.contains(document.activeElement))) {
+        event.preventDefault(); last?.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !dialog?.contains(document.activeElement))) {
+        event.preventDefault(); first?.focus();
+      }
+      return;
+    }
+  }
   const key = event.key.toLowerCase();
   if ((event.ctrlKey || event.metaKey) && key === 'k') {
     event.preventDefault();
@@ -183,17 +226,22 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   }
 }
 
+let disposed = false;
+let disposeEditor: (() => void) | undefined;
 onMounted(async () => {
   // 画布编辑核心依赖真实 DOM，等 Vue 完成挂载后再初始化。
   const editor = await import('./editor/controller');
-  editor.init();
+  if (disposed) return;
+  disposeEditor = editor.init();
   document.body.classList.toggle('sidebar-closed', !sidebarOpen.value);
-  window.addEventListener('keydown', handleGlobalKeydown);
+  window.addEventListener('keydown', handleGlobalKeydown, true);
   window.addEventListener('mindmap:toggle-sidebar', handleSidebarShortcut);
 });
 
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', handleGlobalKeydown);
+  disposed = true;
+  disposeEditor?.();
+  window.removeEventListener('keydown', handleGlobalKeydown, true);
   window.removeEventListener('mindmap:toggle-sidebar', handleSidebarShortcut);
 });
 </script>

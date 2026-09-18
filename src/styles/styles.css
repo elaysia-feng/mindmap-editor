@@ -3045,3 +3045,27 @@ body.sidebar-closed .welcome {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Saving errors must remain visible, including on narrow screens. */
+.save-state[data-state="error"] { color: #b42318; display: inline-flex; }
+[data-theme="dark"] .save-state[data-state="error"] { color: #ffaca5; }
+.node-text[contenteditable="true"] { touch-action: auto; user-select: text; -webkit-user-select: text; }
+@media (pointer: coarse) {
+  .node-toolbar button { min-width: 44px; min-height: 44px; }
+}
+@media (max-width: 1180px) {
+  .document-meta:has(.save-state[data-state="error"]) {
+    display: flex;
+    position: fixed;
+    top: 68px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100vw - 24px);
+    padding: 8px 12px;
+    background: var(--paper);
+    border: 1px solid currentColor;
+    border-radius: 8px;
+  }
+  .document-meta:has(.save-state[data-state="error"]) .meta-divider,
+  .document-meta:has(.save-state[data-state="error"]) .document-copy { display: none; }
+}

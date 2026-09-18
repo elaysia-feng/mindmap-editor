@@ -107,3 +107,21 @@ mindmap-editor/
 - 连接线使用 SVG `<path>` 贝塞尔曲线和输入/输出端口，交互模型参考 Coze/FlowGram 工作流画布
 - 画布使用 CSS `transform: translate + scale` 实现硬件加速的平移缩放
 - 响应式设计：窗口缩放时缩略图和视图自动适配
+
+## 开发验证
+
+使用 Node.js 22.18 或更高版本。
+
+```bash
+npm ci
+npm test
+npm run build
+npx playwright install chromium
+npm run test:e2e
+```
+
+- JSON 导入接受缺少位置、ID 或叶节点 children 的文档；拒绝无效节点及超过 5000 节点 / 100 层的文档。文件上限 5 MB。
+- 保存失败时顶部显示“保存失败，请导出备份”，不要在导出前关闭页面。
+- 手机端可通过搜索操作使用撤销、重做、打开 JSON、清空及适配视图。
+- Markdown 插入和排序优先保留同级同名节点的身份；重命名并同时增删节点时无法可靠推断身份，建议分步操作。
+- 损坏的本地存档会保留在带 `-recovery-` 后缀的存储键中，避免启动时直接覆盖原内容。
