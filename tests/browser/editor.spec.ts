@@ -52,6 +52,8 @@ test('storage failure is visible instead of falsely reporting saved', async ({ p
   await page.evaluate(() => { Storage.prototype.setItem = () => { throw new Error('quota'); }; });
   await page.locator('#btn-theme').click();
   await expect(page.locator('#save-state')).toHaveAttribute('data-state', 'error');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('#save-state')).toBeVisible();
 });
 
 test('JSON imports validate data, repair IDs and reject cyclic flow links', async ({ page }) => {

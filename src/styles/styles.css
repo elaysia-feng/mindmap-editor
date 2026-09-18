@@ -3053,3 +3053,19 @@ body.sidebar-closed .welcome {
 @media (pointer: coarse) {
   .node-toolbar button { min-width: 44px; min-height: 44px; }
 }
+@media (max-width: 1180px) {
+  .document-meta:has(.save-state[data-state="error"]) {
+    display: flex;
+    position: fixed;
+    top: 68px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100vw - 24px);
+    padding: 8px 12px;
+    background: var(--paper);
+    border: 1px solid currentColor;
+    border-radius: 8px;
+  }
+  .document-meta:has(.save-state[data-state="error"]) .meta-divider,
+  .document-meta:has(.save-state[data-state="error"]) .document-copy { display: none; }
+}
