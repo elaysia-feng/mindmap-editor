@@ -28,32 +28,32 @@
   <input id="json-file-input" type="file" accept=".json,application/json" hidden />
 
   <div id="context-menu" class="context-menu hidden" role="menu" aria-label="节点操作">
-    <div class="ctx-item" data-action="add-child" role="menuitem" tabindex="0">
+    <button class="ctx-item" type="button" data-action="add-child" role="menuitem">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
       <span>添加子节点</span>
       <em>Tab</em>
-    </div>
-    <div class="ctx-item" data-action="add-sibling" role="menuitem" tabindex="0">
+    </button>
+    <button class="ctx-item" type="button" data-action="add-sibling" role="menuitem">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14M12 5v14" /></svg>
       <span>添加同级节点</span>
       <em>Enter</em>
-    </div>
-    <div class="ctx-item" data-action="edit" role="menuitem" tabindex="0">
+    </button>
+    <button class="ctx-item" type="button" data-action="edit" role="menuitem">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
       <span>编辑节点</span>
       <em>F2</em>
-    </div>
+    </button>
     <div class="ctx-divider"></div>
-    <div class="ctx-item" data-action="collapse" role="menuitem" tabindex="0">
+    <button class="ctx-item" type="button" data-action="collapse" role="menuitem">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><path d="M6 9l6 6 6-6" /></svg>
       <span>折叠 / 展开</span>
       <em>Space</em>
-    </div>
-    <div class="ctx-item ctx-danger" data-action="delete" role="menuitem" tabindex="0">
+    </button>
+    <button class="ctx-item ctx-danger" type="button" data-action="delete" role="menuitem">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /></svg>
       <span>删除节点</span>
       <em>Del</em>
-    </div>
+    </button>
   </div>
 
   <div id="drag-hint" class="drag-hint hidden">
@@ -77,6 +77,9 @@
   <div id="node-toolbar" class="node-toolbar hidden" aria-label="节点快捷操作">
     <button class="node-tool-btn" type="button" data-action="link" data-tip="从此处拉出连线" aria-label="从此处拉出连线">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+    </button>
+    <button class="node-tool-btn" type="button" data-action="edit" data-tip="编辑节点" aria-label="编辑节点">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
     </button>
     <button class="node-tool-btn" type="button" data-action="add-sibling" data-tip="添加同级节点" aria-label="添加同级节点">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><circle cx="8" cy="12" r="3" /><circle cx="16" cy="12" r="3" /><path d="M11 12h2" /></svg>

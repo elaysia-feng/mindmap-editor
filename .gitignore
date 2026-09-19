@@ -1,5 +1,6 @@
 # OMC 运行时状态
 .omc/
+.impeccable/
 
 # 操作系统垃圾
 .DS_Store

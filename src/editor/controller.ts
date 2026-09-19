@@ -948,8 +948,9 @@ const viewport = {
     const padding = 120;
     const scaleX = (rect.width - padding * 2) / Math.max(b.width, 400);
     const scaleY = (rect.height - padding * 2) / Math.max(b.height, 300);
-    // 适应屏幕用于快速开始编辑，保留可读性；需要总览时仍可手动缩小。
-    this.scale = clamp(Math.min(scaleX, scaleY), Math.max(this.minScale, this.minFitScale), 1);
+    // 适应屏幕首先保证文字可读；较大的脑图允许通过拖拽浏览边缘分支。
+    const readableFloor = rect.width < 600 ? 0.56 : 0.62;
+    this.scale = clamp(Math.min(scaleX, scaleY), Math.max(this.minScale, this.minFitScale, readableFloor), 1);
     this.x = rect.width / 2 - b.centerX * this.scale;
     this.y = rect.height / 2 - b.centerY * this.scale;
     this.apply();
@@ -1474,9 +1475,17 @@ function selectNodeFromMarkdownCursor() {
 }
 
 function renderSelectionOnly() {
-  $$('.node.selected').forEach((node) => node.classList.remove('selected'));
-  const selected = selectedId ? $(`.node[data-id="${selectedId}"]`) : null;
-  if (selected) selected.classList.add('selected');
+  $$('.node').forEach((node) => {
+    const isSelected = node.dataset.id === selectedId;
+    node.classList.toggle('selected', isSelected);
+    const data = mindmap.nodes.get(node.dataset.id);
+    if (data) {
+      node.setAttribute(
+        'aria-label',
+        `${data.text || '空节点'}${data.children.length ? `，${data.children.length} 个子节点` : ''}${isSelected ? '，已选中' : ''}`,
+      );
+    }
+  });
   renderConnections();
   updateNodeToolbar();
 }
@@ -1568,7 +1577,10 @@ function createNodePort(node, type) {
   port.className = `node-port node-port-${type}`;
   port.dataset.nodeId = node.id;
   port.dataset.port = type;
-  port.setAttribute('aria-label', type === 'output' ? '输出端口' : '输入端口');
+  port.setAttribute(
+    'aria-label',
+    `${node.text || '空节点'}的${type === 'output' ? '输出' : '输入'}端口`,
+  );
   port.title = type === 'output' ? '从这里拖到目标节点的输入端口' : '输入端口';
   port.addEventListener('mousedown', (e) => {
     if (type === 'output') startLinkDrag(e, node.id);
@@ -1599,12 +1611,29 @@ function renderNodes() {
   container.innerHTML = '';
   nodeElements.clear();
 
+  // “聚焦星路”只强调当前节点、祖先路径和直接子节点，避免大型脑图同时争夺注意力。
+  const focusIds = new Set();
+  const selectedNode = selectedId ? mindmap.nodes.get(selectedId) : null;
+  if (selectedNode) {
+    let current = selectedNode;
+    while (current) {
+      focusIds.add(current.id);
+      current = mindmap.findParent(current);
+    }
+    selectedNode.children.forEach((child) => focusIds.add(child.id));
+  }
+
   const walk = (node) => {
     if (node !== mindmap.root && mindmap.isCollapsedAncestor(node)) return;
 
     const el = document.createElement('div');
     el.className = 'node';
     el.dataset.id = node.id;
+    el.setAttribute('role', 'group');
+    el.tabIndex = 0;
+    el.setAttribute('aria-label', `${node.text || '空节点'}${node.children.length ? `，${node.children.length} 个子节点` : ''}${selectedId === node.id ? '，已选中' : ''}`);
+    if (node.children.length > 0) el.setAttribute('aria-expanded', String(!node.collapsed));
+    el.setAttribute('aria-keyshortcuts', 'Tab Enter F2 Delete Space');
     el.dataset.side = node !== mindmap.root && node.x < mindmap.root.x ? 'left' : 'right';
     el.style.left = node.x + 'px';
     el.style.top = node.y + 'px';
@@ -1617,6 +1646,9 @@ function renderNodes() {
       if (cnt > 0) el.dataset.count = '+' + cnt;
     }
     if (selectedId === node.id) el.classList.add('selected');
+    if (selectedNode) {
+      el.classList.add(focusIds.has(node.id) ? 'focus-path' : 'focus-muted');
+    }
 
     // 文本节点（可编辑）
     const textSpan = document.createElement('span');
@@ -1629,8 +1661,10 @@ function renderNodes() {
 
     // Coze 风格输出端口：按住「+」拉线，落到空白处后再选择要创建的节点。
     const addBtn = document.createElement('button');
+    addBtn.type = 'button';
     addBtn.className = 'node-add-child';
     addBtn.innerHTML = '+';
+    addBtn.setAttribute('aria-label', `从“${node.text || '空节点'}”创建子节点或连线`);
     addBtn.title = '从这里拖出连线；落到空白处可新建节点';
     addBtn.addEventListener('mousedown', (e) => {
       startLinkDrag(e, node.id, { createNodeOnEmpty: true });
@@ -1846,6 +1880,9 @@ function createTreeConnectionPaths(from) {
     ].join(' '), 'connection tree-trunk');
     trunk.dataset.depth = String(depth);
     trunk.dataset.edgeKind = 'tree-trunk';
+    // 干线也标记所属父节点，拖动任一子节点时才能一起重建分叉几何。
+    trunk.dataset.from = from.id;
+    trunk.dataset.to = '';
     if (selectedId === from.id || sideChildren.some((child) => child.id === selectedId)) {
       trunk.classList.add('highlighted');
     }
@@ -1920,10 +1957,15 @@ function renderOutline() {
   const walk = (node, depth) => {
     if (depth > 5) return;
     if (node !== mindmap.root && mindmap.isCollapsedAncestor(node)) return;
-    const item = document.createElement('div');
+    const item = document.createElement('button');
+    item.type = 'button';
     item.className = `outline-item depth-${Math.min(depth, 3)}`;
     item.textContent = node.text || '(空)';
     item.dataset.id = node.id;
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('aria-level', String(depth + 1));
+    item.setAttribute('aria-label', node.text || '空节点');
+    if (node.children.length > 0) item.setAttribute('aria-expanded', String(!node.collapsed));
     item.addEventListener('click', () => focusNode(node.id));
     container.appendChild(item);
     node.children.forEach((c) => walk(c, depth + 1));
@@ -2037,7 +2079,10 @@ function updateNodeToolbar() {
   const rect = getCanvasRect();
   const sx = node.x * viewport.scale + viewport.x + rect.left;
   const sy = node.y * viewport.scale + viewport.y + rect.top;
-  bar.style.left = sx + 'px';
+  const halfWidth = bar.offsetWidth / 2;
+  bar.style.left = (halfWidth > 0
+    ? clamp(sx, halfWidth + 8, window.innerWidth - halfWidth - 8)
+    : sx) + 'px';
   bar.style.top = (sy + 50 * viewport.scale) + 'px';
 }
 
@@ -2323,6 +2368,10 @@ function handleToolAction(action, id) {
       startPersistentLink(id);
       break;
     }
+    case 'edit': {
+      editNode(id);
+      break;
+    }
     case 'add-parent': {
       const oldParent = mindmap.findParent(node);
       if (!oldParent || oldParent === mindmap.root) {
@@ -2440,24 +2489,26 @@ function updateDragVisuals(node) {
 
 function updateDragConnectionsFor(node) {
   const svg = $('#connections');
-  // 仅清除受影响 path
-  svg.querySelectorAll(`[data-from="${node.id}"], [data-to="${node.id}"]`).forEach((p) => p.remove());
-
-  // 父节点 → 当前节点
   const parent = mindmap.findParent(node);
-  if (parent && !mindmap.isCollapsedAncestor(parent)) {
-    const path = createConnectionPath(parent, node);
-    svg.appendChild(path);
-  }
+  const affectedSources = [node, parent].filter((item, index, list) => (
+    item && list.indexOf(item) === index
+  ));
+  const affectedIds = new Set(affectedSources.map((item) => item.id));
 
-  // 当前节点 → 直接子节点
-  node.children.forEach((child) => {
-    if (!mindmap.isCollapsedAncestor(child)) {
-      const path = createConnectionPath(node, child);
-      svg.appendChild(path);
+  // 先移除受影响父级的整组树边，并清掉自由连线；否则多子节点干线会残留，
+  // 自由连线也会在下一次完整重绘前重复追加。
+  svg.querySelectorAll('.connection').forEach((path) => {
+    const isFree = path.classList.contains('free');
+    if (isFree || affectedIds.has(path.dataset.from) || affectedIds.has(path.dataset.to)) {
+      path.remove();
     }
   });
-  renderFreeConnections(svg, node);
+
+  affectedSources.forEach((source) => {
+    if (mindmap.isCollapsedAncestor(source) || source.collapsed) return;
+    createTreeConnectionPaths(source).forEach((path) => svg.appendChild(path));
+  });
+  renderFreeConnections(svg);
 }
 
 /* ============== 事件绑定 ============== */
@@ -2492,6 +2543,16 @@ function setupEvents() {
 
   // 触屏双指 pinch 缩放
   let lastPinchDist = 0;
+  let lastCanvasTap = null;
+  let lastNodeTap = null;
+  let touchStartPoint = null;
+  let touchMoved = false;
+  const isDoubleTap = (lastTap, id, time, x, y) => Boolean(
+    lastTap
+    && lastTap.id === id
+    && time - lastTap.time <= 320
+    && Math.hypot(x - lastTap.x, y - lastTap.y) <= 24,
+  );
   vp.addEventListener('touchstart', (e) => {
     e.preventDefault();
     if (e.touches.length === 2) {
@@ -2502,8 +2563,14 @@ function setupEvents() {
       return;
     }
     if (e.touches.length === 1) {
+      touchStartPoint = {
+        x: e.touches[0].clientX,
+        y: e.touches[0].clientY,
+      };
+      touchMoved = false;
       const isOnEmpty = !e.target.closest?.('.node, .node-toolbar, .context-menu');
       if (isOnEmpty) {
+        lastNodeTap = null;
         if (pendingNodeCreation) {
           closeNodePicker();
           return;
@@ -2544,7 +2611,31 @@ function setupEvents() {
       lastPinchDist = dist;
     }
   }, { passive: false });
-  vp.addEventListener('touchend', () => { lastPinchDist = 0; }, { passive: true });
+  vp.addEventListener('touchend', (e) => {
+    lastPinchDist = 0;
+    const touch = e.changedTouches?.[0];
+    if (!touch || e.touches.length > 0) return;
+    const isOnEmpty = !e.target.closest?.('.node, .node-toolbar, .context-menu');
+    if (!isOnEmpty || touchMoved || draggingNode || pendingNodeDrag || linkDrag || pendingNodeCreation) {
+      if (!isOnEmpty) lastCanvasTap = null;
+      return;
+    }
+
+    const now = performance.now();
+    if (isDoubleTap(lastCanvasTap, 'canvas', now, touch.clientX, touch.clientY)) {
+      e.preventDefault();
+      lastCanvasTap = null;
+      const point = getCanvasWorldPoint(touch.clientX, touch.clientY);
+      addChildNode(mindmap.root.id, '新节点', { x: point.x, y: point.y, radius: 0 }, '空白处新建节点');
+    } else {
+      lastCanvasTap = {
+        id: 'canvas',
+        time: now,
+        x: touch.clientX,
+        y: touch.clientY,
+      };
+    }
+  }, { passive: false });
 
   // 画布按下 - 平移或双击新建
   vp.addEventListener('mousedown', (e) => {
@@ -2642,6 +2733,9 @@ function setupEvents() {
 
     e.preventDefault();
     const touch = e.touches[0];
+    if (touchStartPoint && Math.hypot(touch.clientX - touchStartPoint.x, touch.clientY - touchStartPoint.y) >= 5) {
+      touchMoved = true;
+    }
     if (!draggingNode && pendingNodeDrag) {
       const dx = touch.clientX - pendingNodeDrag.startX;
       const dy = touch.clientY - pendingNodeDrag.startY;
@@ -2681,8 +2775,16 @@ function setupEvents() {
     } else if (e.touches.length === 0) {
       finishTouchGesture(false);
     }
+    if (e.touches.length === 0) {
+      touchStartPoint = null;
+      touchMoved = false;
+    }
   }, { passive: true });
   window.addEventListener('touchcancel', () => {
+    lastCanvasTap = null;
+    lastNodeTap = null;
+    touchStartPoint = null;
+    touchMoved = false;
     if (linkDrag) finishLinkDrag(0, 0, true);
     else finishTouchGesture(true);
   }, { passive: true });
@@ -2876,6 +2978,7 @@ function setupEvents() {
     if (e.touches.length !== 1 || editing) return;
     // 禁止触屏产生后续兼容 mouse 事件，避免一次触摸同时进入两套拖动状态机。
     e.preventDefault();
+    lastCanvasTap = null;
     if (pendingNodeCreation) {
       closeNodePicker();
       return;
@@ -2931,11 +3034,50 @@ function setupEvents() {
     updateNodeToolbar();
   }, { passive: false });
 
+  // 触屏按下会被拖拽状态机拦截，补充明确的双击判定，避免兼容 mouse 事件被 preventDefault 后无法编辑。
+  nodesEl.addEventListener('touchend', (e) => {
+    if (e.changedTouches.length !== 1) return;
+    const nodeEl = e.target.closest?.('.node');
+    if (!nodeEl || e.target.closest?.('.node-add-child, .node-port')) {
+      lastNodeTap = null;
+      return;
+    }
+    const touch = e.changedTouches[0];
+    if (touchMoved || draggingNode || linkDrag) {
+      lastNodeTap = null;
+      return;
+    }
+    const now = performance.now();
+    const id = nodeEl.dataset.id;
+    if (isDoubleTap(lastNodeTap, id, now, touch.clientX, touch.clientY)) {
+      e.preventDefault();
+      e.stopPropagation();
+      pendingNodeDrag = null;
+      dragStartSnapshot = null;
+      selectedId = id;
+      selectedLinkId = null;
+      renderSelectionOnly();
+      lastNodeTap = null;
+      editNode(id);
+      return;
+    }
+    lastNodeTap = { id, time: now, x: touch.clientX, y: touch.clientY };
+  }, { passive: false });
+
   nodesEl.addEventListener('dblclick', (e) => {
     const nodeEl = e.target.closest('.node');
     if (!nodeEl) return;
     e.stopPropagation();
     editNode(nodeEl.dataset.id);
+  });
+
+  nodesEl.addEventListener('focusin', (e) => {
+    if (editing) return;
+    const nodeEl = e.target.closest?.('.node');
+    if (!nodeEl || !mindmap.nodes.has(nodeEl.dataset.id)) return;
+    selectedId = nodeEl.dataset.id;
+    selectedLinkId = null;
+    renderSelectionOnly();
   });
 
   nodesEl.addEventListener('contextmenu', (e) => {
@@ -2948,6 +3090,15 @@ function setupEvents() {
 
   // 键盘
   window.addEventListener('keydown', (e) => {
+    if (document.body.classList.contains('library-open')) return;
+    const contextMenu = $('#context-menu');
+    if (contextMenu && !contextMenu.classList.contains('hidden')) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        hideContextMenu();
+      }
+      return;
+    }
     if (editing) {
       // 编辑中：Esc / Enter 由编辑框处理
       return;
@@ -3275,9 +3426,33 @@ function showContextMenu(x, y, id) {
   menu.style.top = y + 'px';
 
   $$('.ctx-item').forEach((item) => {
-    item.onclick = () => {
+    item.onclick = (event) => {
+      event.stopPropagation();
       handleContextAction(item.dataset.action, id);
       hideContextMenu();
+    };
+    item.onkeydown = (event) => {
+      const items = Array.from(menu.querySelectorAll('.ctx-item'));
+      const index = items.indexOf(item);
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        event.stopPropagation();
+        const offset = event.key === 'ArrowDown' ? 1 : -1;
+        items[(index + offset + items.length) % items.length]?.focus();
+      } else if (event.key === 'Home' || event.key === 'End') {
+        event.preventDefault();
+        event.stopPropagation();
+        items[event.key === 'Home' ? 0 : items.length - 1]?.focus();
+      } else if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        event.stopPropagation();
+        handleContextAction(item.dataset.action, id);
+        hideContextMenu();
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        hideContextMenu();
+      }
     };
   });
 
@@ -3286,11 +3461,17 @@ function showContextMenu(x, y, id) {
     const rect = menu.getBoundingClientRect();
     if (rect.right > window.innerWidth) menu.style.left = (x - rect.width) + 'px';
     if (rect.bottom > window.innerHeight) menu.style.top = (y - rect.height) + 'px';
+    menu.querySelector('.ctx-item')?.focus();
   });
 }
 
 function hideContextMenu() {
-  $('#context-menu').classList.add('hidden');
+  const menu = $('#context-menu');
+  const shouldRestoreFocus = menu.contains(document.activeElement);
+  menu.classList.add('hidden');
+  if (shouldRestoreFocus) {
+    $(`.node[data-id="${selectedId}"]`)?.focus();
+  }
 }
 
 function handleContextAction(action, id) {
@@ -3306,6 +3487,7 @@ const LEGACY_STORAGE_KEY = 'mindmap-studio-v1';
 const LAYOUT_VERSION = 2;
 const MARKDOWN_FORMAT_VERSION = 2;
 let saveTimer = null;
+let saveStateErrorNotified = false;
 let layoutNeedsMigration = false;
 let markdownNeedsMigration = false;
 
@@ -3313,7 +3495,7 @@ function saveState() {
   try {
     const editor = $('#markdown-editor');
     if (editor) markdownText = editor.value;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    const snapshot = {
       version: 2,
       layoutVersion: LAYOUT_VERSION,
       markdownFormatVersion: MARKDOWN_FORMAT_VERSION,
@@ -3324,13 +3506,26 @@ function saveState() {
       mode: activeMode,
       viewport: { x: viewport.x, y: viewport.y, scale: viewport.scale },
       theme: document.documentElement.getAttribute('data-theme') || 'light',
-    }));
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    window.dispatchEvent(new CustomEvent('mindmap:state-saved', { detail: snapshot }));
     const saveStateEl = $('#save-state');
     if (saveStateEl) {
       saveStateEl.textContent = '本地已保存';
       saveStateEl.dataset.state = 'saved';
     }
-  } catch (e) { /* ignore quota */ }
+    saveStateErrorNotified = false;
+  } catch (e) {
+    const saveStateEl = $('#save-state');
+    if (saveStateEl) {
+      saveStateEl.textContent = '保存失败';
+      saveStateEl.dataset.state = 'error';
+    }
+    if (!saveStateErrorNotified) {
+      showToast('本地保存失败：请检查浏览器存储空间', 'error');
+      saveStateErrorNotified = true;
+    }
+  }
 }
 
 function saveStateThrottled() {
@@ -3363,6 +3558,50 @@ function loadState() {
       : generated;
     return true;
   } catch (e) {
+    return false;
+  }
+}
+
+function loadDocumentSnapshot(data) {
+  try {
+    if (!data?.root) return false;
+    const nextMap = MindMap.fromJSON(data.root, data.links);
+    if (!nextMap) return false;
+    commitActiveEdit();
+    mindmap = nextMap;
+    selectedId = null;
+    undoStack.length = 0;
+    redoStack.length = 0;
+    layoutNeedsMigration = data.layoutVersion !== LAYOUT_VERSION;
+    markdownNeedsMigration = data.markdownFormatVersion !== MARKDOWN_FORMAT_VERSION;
+    if (data.viewport) {
+      viewport.x = Number.isFinite(data.viewport.x) ? data.viewport.x : 0;
+      viewport.y = Number.isFinite(data.viewport.y) ? data.viewport.y : 0;
+      viewport.scale = clamp(Number(data.viewport.scale) || 1, viewport.minScale, viewport.maxScale);
+    } else {
+      viewport.x = 0;
+      viewport.y = 0;
+      viewport.scale = 1;
+    }
+    if (data.theme) document.documentElement.setAttribute('data-theme', data.theme);
+    activeMode = ['map', 'markdown', 'split'].includes(data.mode) ? data.mode : 'map';
+    const generated = mindmap.toMarkdown();
+    markdownText = typeof data.markdownText === 'string' ? data.markdownText : generated;
+    markdownLastValidText = typeof data.markdownLastValidText === 'string'
+      ? data.markdownLastValidText
+      : generated;
+    setActiveMode(activeMode, false);
+    updateMarkdownEditorValue(markdownText);
+    clearMarkdownLineMaps();
+    render();
+    viewport.apply();
+    updateHistoryButtons();
+    if (!data.viewport) viewport.fitToContent(mindmap);
+    $('#welcome')?.remove();
+    saveState();
+    return true;
+  } catch (error) {
+    showToast('文档打开失败，请尝试导入备份', 'error');
     return false;
   }
 }
@@ -3699,6 +3938,15 @@ function showWelcome() {
 export function init() {
   setupEvents();
   setupToolbar();
+  window.addEventListener('mindmap:flush-save', () => {
+    clearTimeout(saveTimer);
+    commitActiveEdit();
+    saveState();
+  });
+
+  window.addEventListener('mindmap:load-document', (event) => {
+    loadDocumentSnapshot(event.detail);
+  });
 
   const loaded = loadState();
   setActiveMode(activeMode, false);
@@ -3711,6 +3959,7 @@ export function init() {
     render();
     if (!hasDocumentContent()) {
       setActiveMode('map', false);
+      viewport.fitToContent(mindmap);
       showWelcome();
     }
   } else {

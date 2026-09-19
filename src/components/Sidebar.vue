@@ -90,7 +90,7 @@ function selectTab(tab: SidebarTab) {
           </div>
           <span class="panel-hint">点击定位</span>
         </div>
-        <div id="outline" aria-label="脑图大纲"></div>
+        <div id="outline" role="tree" aria-label="脑图大纲"></div>
       </section>
 
       <section v-show="activeTab === 'shortcuts'" class="sidebar-view shortcuts-view" role="tabpanel">

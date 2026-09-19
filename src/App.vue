@@ -1,68 +1,215 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import CanvasStage from './components/CanvasStage.vue';
-import TopBar from './components/TopBar.vue';
+import DocumentLibrary from './components/DocumentLibrary.vue';
+import EditorOverlays from './components/EditorOverlays.vue';
 import MarkdownPanel from './components/MarkdownPanel.vue';
 import Sidebar from './components/Sidebar.vue';
+import TopBar from './components/TopBar.vue';
 import WorkspaceRail from './components/WorkspaceRail.vue';
-import EditorOverlays from './components/EditorOverlays.vue';
+import {
+  LEGACY_STORAGE_KEY,
+  createDocument,
+  duplicateDocument,
+  getDocument,
+  listDocuments,
+  migrateLegacyDocument,
+  moveDocumentToTrash,
+  restoreDocument,
+  saveDocument,
+  type EditorSnapshot,
+  type MindMapDocument,
+} from './storage/documentRepository';
 
 type SidebarTab = 'overview' | 'outline' | 'shortcuts';
+type Command = { id: string; label: string; description: string; shortcut?: string; group: string };
 
-type Command = {
-  id: string;
-  label: string;
-  description: string;
-  shortcut?: string;
-  group: string;
-};
-
-const sidebarOpen = ref(typeof window === 'undefined' || window.innerWidth > 768);
-const activeSidebarTab = ref<SidebarTab>('overview');
+const documents = ref<MindMapDocument[]>([]);
+const trash = ref<MindMapDocument[]>([]);
+const currentDocumentId = ref<string | null>(null);
+const editorReady = ref(false);
+const editorInitialized = ref(false);
+const libraryOpen = ref(false);
+const storageError = ref('');
+const activeSidebarTab = ref<SidebarTab>('outline');
+const sidebarOpen = ref(false);
 const commandOpen = ref(false);
 const helpOpen = ref(false);
 const commandQuery = ref('');
 const selectedCommandIndex = ref(0);
 const commandInput = ref<HTMLInputElement | null>(null);
+const commandReturnFocus = ref<HTMLElement | null>(null);
+const helpReturnFocus = ref<HTMLElement | null>(null);
+
+const SETTINGS_KEY = 'inkmap-library-settings';
+let saveQueue = Promise.resolve();
 
 const commands: Command[] = [
   { id: 'new-node', label: '添加一个新节点', description: '从当前选中节点创建子节点', shortcut: 'Tab', group: '编辑' },
   { id: 'layout', label: '整理当前布局', description: '按层级重新排列整张脑图', shortcut: 'F', group: '编辑' },
-  { id: 'map', label: '切换到脑图', description: '回到空间画布视图', group: '视图' },
-  { id: 'split', label: '打开分屏视图', description: '同时查看结构与 Markdown', group: '视图' },
-  { id: 'markdown', label: '打开 Markdown', description: '用文本快速编辑整张脑图', group: '视图' },
-  { id: 'open-md', label: '打开 Markdown 文件', description: '从本地文件载入结构', group: '文件' },
-  { id: 'export-md', label: '导出 Markdown', description: '下载当前文本结构', group: '文件' },
+  { id: 'map', label: '回到脑图', description: '关闭文字稿并回到空间画布', group: '视图' },
+  { id: 'split', label: '打开 Markdown 文字稿', description: '在画布旁编辑线性结构', group: '视图' },
+  { id: 'outline', label: '打开结构导航', description: '定位节点并查看整张脑图', shortcut: 'Ctrl B', group: '导航' },
+  { id: 'library', label: '返回文档库', description: '打开本地观测日志', group: '文件' },
+  { id: 'export-md', label: '导出 Markdown', description: '下载当前文字结构', group: '文件' },
   { id: 'export-json', label: '导出 JSON 备份', description: '下载包含位置与连线的备份', group: '文件' },
-  { id: 'outline', label: '查看大纲', description: '在右侧导航中定位节点', group: '导航' },
-  { id: 'help', label: '打开快捷键指南', description: '查看编辑、画布和连线操作', group: '帮助' },
-  { id: 'theme', label: '切换明暗主题', description: '调整当前工作台的阅读环境', group: '偏好' },
+  { id: 'help', label: '快捷键与帮助', description: '查看编辑、画布和连线操作', group: '帮助' },
+  { id: 'theme', label: '切换日间 / 夜间航图', description: '调整当前阅读环境', group: '偏好' },
 ];
 
 const filteredCommands = computed(() => {
-  const query = commandQuery.value.trim().toLowerCase();
-  if (!query) return commands;
-  return commands.filter((command) => (
-    [command.label, command.description, command.group].join(' ').toLowerCase().includes(query)
-  ));
+  const query = commandQuery.value.trim().toLocaleLowerCase();
+  return query
+    ? commands.filter((command) => [command.label, command.description, command.group].join(' ').toLocaleLowerCase().includes(query))
+    : commands;
 });
-
 const activeCommand = computed(() => filteredCommands.value[selectedCommandIndex.value]);
 
-watch(commandQuery, () => {
-  selectedCommandIndex.value = 0;
-});
+watch(commandQuery, () => { selectedCommandIndex.value = 0; });
+
+function readSettings() {
+  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') as { lastDocumentId?: string }; }
+  catch { return {}; }
+}
+
+function writeSettings() {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify({ lastDocumentId: currentDocumentId.value }));
+}
+
+async function refreshDocuments() {
+  documents.value = await listDocuments(false);
+  trash.value = await listDocuments(true);
+}
+
+async function initializeEditor() {
+  if (editorInitialized.value) return;
+  editorReady.value = true;
+  await nextTick();
+  const editor = await import('./editor/controller');
+  editor.init();
+  editorInitialized.value = true;
+}
+
+async function openDocument(id: string) {
+  if (editorInitialized.value && currentDocumentId.value) {
+    window.dispatchEvent(new Event('mindmap:flush-save'));
+  }
+  await saveQueue;
+  const documentRecord = await getDocument(id);
+  if (!documentRecord || documentRecord.deletedAt) return;
+  localStorage.setItem(LEGACY_STORAGE_KEY, JSON.stringify(documentRecord.content));
+  currentDocumentId.value = id;
+  writeSettings();
+  if (!editorInitialized.value) {
+    await initializeEditor();
+  } else {
+    window.dispatchEvent(new CustomEvent('mindmap:load-document', { detail: documentRecord.content }));
+  }
+  libraryOpen.value = false;
+  document.body.classList.remove('library-open');
+}
+
+async function createNewDocument(template?: string) {
+  const record = await createDocument();
+  await refreshDocuments();
+  await openDocument(record.id);
+  if (template) {
+    await nextTick();
+    window.dispatchEvent(new CustomEvent('mindmap:load-example', { detail: template }));
+  }
+}
+
+async function duplicate(id: string) {
+  await saveQueue;
+  await duplicateDocument(id);
+  await refreshDocuments();
+}
+
+async function moveToTrash(id: string) {
+  await saveQueue;
+  await moveDocumentToTrash(id);
+  if (currentDocumentId.value === id) {
+    currentDocumentId.value = null;
+    writeSettings();
+  }
+  await refreshDocuments();
+}
+
+async function restore(id: string) {
+  await restoreDocument(id);
+  await refreshDocuments();
+}
+
+async function importBackup(file: File) {
+  try {
+    const data = JSON.parse(await file.text());
+    const snapshot = (data.content || data) as EditorSnapshot;
+    if (!snapshot.root) throw new Error('备份中没有有效脑图');
+    const record = await createDocument(undefined, snapshot);
+    await refreshDocuments();
+    await openDocument(record.id);
+  } catch (error) {
+    storageError.value = error instanceof Error ? error.message : '导入备份失败';
+  }
+}
+
+async function exportBackup(id: string) {
+  const record = await getDocument(id);
+  if (!record) return;
+  const blob = new Blob([JSON.stringify(record.content, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `${record.title || 'inkmap'}.json`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function showLibrary() {
+  window.dispatchEvent(new Event('mindmap:flush-save'));
+  closeCommand();
+  setSidebarOpen(false);
+  libraryOpen.value = true;
+  document.body.classList.add('library-open');
+  saveQueue.then(refreshDocuments).catch(() => { storageError.value = '无法读取本地文档库'; });
+}
+
+function closeLibrary() {
+  if (!currentDocumentId.value) return;
+  libraryOpen.value = false;
+  document.body.classList.remove('library-open');
+}
 
 function setSidebarOpen(open: boolean) {
   sidebarOpen.value = open;
   document.body.classList.toggle('sidebar-closed', !open);
+  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+}
+
+function selectWorkspaceTab(tab: SidebarTab) {
+  const shouldOpen = !sidebarOpen.value || activeSidebarTab.value !== tab;
+  activeSidebarTab.value = tab === 'shortcuts' ? 'outline' : tab;
+  setSidebarOpen(shouldOpen);
 }
 
 function clickExisting(selector: string) {
   document.querySelector<HTMLButtonElement>(selector)?.click();
 }
 
+function rememberFocus(target: { value: HTMLElement | null }) {
+  const active = document.activeElement;
+  target.value = active instanceof HTMLElement && !active.closest('.overlay-layer') ? active : null;
+}
+
+function restoreFocus(target: { value: HTMLElement | null }) {
+  const element = target.value;
+  target.value = null;
+  if (element?.isConnected) nextTick(() => element.focus());
+}
+
 function openCommand() {
+  if (libraryOpen.value || commandOpen.value) return;
+  rememberFocus(commandReturnFocus);
   commandOpen.value = true;
   commandQuery.value = '';
   selectedCommandIndex.value = 0;
@@ -70,266 +217,173 @@ function openCommand() {
 }
 
 function closeCommand() {
+  if (!commandOpen.value) return;
   commandOpen.value = false;
   commandQuery.value = '';
+  restoreFocus(commandReturnFocus);
 }
 
-function revealSidebar(tab: SidebarTab = activeSidebarTab.value) {
-  activeSidebarTab.value = tab;
-  setSidebarOpen(true);
-  document.querySelector('#sidebar')?.removeAttribute('style');
-  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+function openHelp() {
+  rememberFocus(helpReturnFocus);
+  helpOpen.value = true;
 }
 
-function toggleSidebar() {
-  if (sidebarOpen.value) {
-    setSidebarOpen(false);
-    return;
-  }
-  revealSidebar();
-}
-
-function selectSidebarTab(tab: SidebarTab) {
-  revealSidebar(tab);
-}
-
-function selectWorkspaceTab(tab: SidebarTab) {
-  if (tab === 'overview') {
-    activeSidebarTab.value = 'overview';
-    setSidebarOpen(false);
-    return;
-  }
-  selectSidebarTab(tab);
-}
-
-function handleSidebarShortcut() {
-  toggleSidebar();
+function closeHelp() {
+  helpOpen.value = false;
+  restoreFocus(helpReturnFocus);
 }
 
 function runCommand(command: Command | undefined = activeCommand.value) {
   if (!command) return;
-
   closeCommand();
-  switch (command.id) {
-    case 'new-node':
-      clickExisting('#btn-add-root');
-      break;
-    case 'layout':
-      clickExisting('#btn-auto-layout');
-      break;
-    case 'map':
-      clickExisting('.mode-btn[data-mode="map"]');
-      break;
-    case 'split':
-      clickExisting('.mode-btn[data-mode="split"]');
-      break;
-    case 'markdown':
-      clickExisting('.mode-btn[data-mode="markdown"]');
-      break;
-    case 'open-md':
-      clickExisting('#md-open-file');
-      break;
-    case 'export-md':
-      clickExisting('#btn-export-md');
-      break;
-    case 'export-json':
-      clickExisting('#btn-export-json');
-      break;
-    case 'outline':
-      revealSidebar('outline');
-      break;
-    case 'help':
-      helpOpen.value = true;
-      break;
-    case 'theme':
-      clickExisting('#btn-theme');
-      break;
-    default:
-      break;
-  }
+  const actions: Record<string, () => void> = {
+    'new-node': () => clickExisting('#btn-add-root'),
+    layout: () => clickExisting('#btn-auto-layout'),
+    map: () => clickExisting('.mode-btn[data-mode="map"]'),
+    split: () => clickExisting('.mode-btn[data-mode="split"]'),
+    outline: () => setSidebarOpen(true),
+    library: showLibrary,
+    'export-md': () => clickExisting('#btn-export-md'),
+    'export-json': () => clickExisting('#btn-export-json'),
+    help: openHelp,
+    theme: () => clickExisting('#btn-theme'),
+  };
+  actions[command.id]?.();
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
+  if (libraryOpen.value) return;
   const key = event.key.toLowerCase();
   if ((event.ctrlKey || event.metaKey) && key === 'k') {
     event.preventDefault();
     openCommand();
     return;
   }
-
+  if ((event.ctrlKey || event.metaKey) && key === 'b') {
+    event.preventDefault();
+    setSidebarOpen(!sidebarOpen.value);
+    return;
+  }
   if (commandOpen.value) {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      selectedCommandIndex.value = Math.min(
-        selectedCommandIndex.value + 1,
-        Math.max(0, filteredCommands.value.length - 1),
-      );
+      selectedCommandIndex.value = Math.min(selectedCommandIndex.value + 1, filteredCommands.value.length - 1);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
       selectedCommandIndex.value = Math.max(0, selectedCommandIndex.value - 1);
     } else if (event.key === 'Enter') {
       event.preventDefault();
       runCommand();
-    } else if (event.key === 'Escape') {
-      event.preventDefault();
-      closeCommand();
-    }
-    return;
-  }
-
-  if (helpOpen.value && event.key === 'Escape') {
-    event.preventDefault();
-    helpOpen.value = false;
+    } else if (event.key === 'Escape') closeCommand();
+  } else if (helpOpen.value && event.key === 'Escape') {
+    closeHelp();
   }
 }
 
+function handleEditorSave(event: Event) {
+  if (!currentDocumentId.value) return;
+  const snapshot = structuredClone((event as CustomEvent<EditorSnapshot>).detail);
+  if (!snapshot?.root) return;
+  const id = currentDocumentId.value;
+  saveQueue = saveQueue.then(async () => {
+    try {
+      await saveDocument(id, snapshot);
+      storageError.value = '';
+      await refreshDocuments();
+    } catch {
+      storageError.value = '本地文档库保存失败，请先导出备份';
+      const state = document.querySelector<HTMLElement>('#save-state');
+      if (state) {
+        state.textContent = '保存失败';
+        state.dataset.state = 'error';
+      }
+    }
+  });
+}
+
 onMounted(async () => {
-  // 画布编辑核心依赖真实 DOM，等 Vue 完成挂载后再初始化。
-  const editor = await import('./editor/controller');
-  editor.init();
-  document.body.classList.toggle('sidebar-closed', !sidebarOpen.value);
   window.addEventListener('keydown', handleGlobalKeydown);
-  window.addEventListener('mindmap:toggle-sidebar', handleSidebarShortcut);
+  window.addEventListener('mindmap:state-saved', handleEditorSave);
+  document.body.classList.add('sidebar-closed');
+  try {
+    await migrateLegacyDocument();
+    await refreshDocuments();
+    const lastId = readSettings().lastDocumentId;
+    const target = documents.value.find((item) => item.id === lastId) || documents.value[0];
+    if (target) {
+      await openDocument(target.id);
+    } else {
+      libraryOpen.value = true;
+      document.body.classList.add('library-open');
+    }
+  } catch {
+    storageError.value = '无法打开本地文档库，请检查浏览器存储权限';
+    libraryOpen.value = true;
+    document.body.classList.add('library-open');
+  }
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleGlobalKeydown);
-  window.removeEventListener('mindmap:toggle-sidebar', handleSidebarShortcut);
+  window.removeEventListener('mindmap:state-saved', handleEditorSave);
 });
 </script>
 
 <template>
-  <WorkspaceRail
-    :active-tab="activeSidebarTab"
-    :sidebar-open="sidebarOpen"
-    @select="selectWorkspaceTab"
-    @command="openCommand"
-    @help="helpOpen = true"
-  />
-  <CanvasStage />
-  <TopBar
-    @command="openCommand"
-    @help="helpOpen = true"
-    @toggle-sidebar="toggleSidebar"
-  />
-  <MarkdownPanel />
-  <Sidebar
-    :open="sidebarOpen"
-    :active-tab="activeSidebarTab"
-    @update:active-tab="selectSidebarTab"
-    @help="helpOpen = true"
-    @close="setSidebarOpen(false)"
-  />
-  <EditorOverlays />
-
-  <Teleport to="body">
-    <div
-      v-if="commandOpen"
-      class="overlay-layer command-layer"
-      role="presentation"
-      @click.self="closeCommand"
-    >
-      <section
-        class="command-palette"
-        role="dialog"
-        aria-modal="true"
-        aria-label="搜索操作"
-      >
-        <div class="command-search-row">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="6.5" />
-            <path d="m16 16 4.5 4.5" />
-          </svg>
-          <input
-            ref="commandInput"
-            v-model="commandQuery"
-            type="search"
-            placeholder="搜索操作、视图或文件…"
-            aria-label="搜索操作、视图或文件"
-          />
-          <kbd>Esc</kbd>
-        </div>
-        <div class="command-list" role="listbox" aria-label="操作列表">
-          <button
-            v-for="(command, index) in filteredCommands"
-            :key="command.id"
-            type="button"
-            class="command-item"
-            :class="{ active: index === selectedCommandIndex }"
-            role="option"
-            :aria-selected="index === selectedCommandIndex"
-            @mouseenter="selectedCommandIndex = index"
-            @click="runCommand(command)"
-          >
-            <span class="command-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M6 12h12M12 6v12" />
-              </svg>
-            </span>
-            <span class="command-copy">
-              <strong>{{ command.label }}</strong>
-              <small>{{ command.description }}</small>
-            </span>
-            <span class="command-group">{{ command.group }}</span>
-            <kbd v-if="command.shortcut">{{ command.shortcut }}</kbd>
-          </button>
-          <div v-if="filteredCommands.length === 0" class="command-empty">
-            没有找到对应操作，试试“布局”或“Markdown”。
-          </div>
-        </div>
-        <div class="command-footer">
-          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
-          <span><kbd>Enter</kbd> 执行</span>
-          <span class="command-footer-note">所有内容只保存在本地浏览器</span>
-        </div>
-      </section>
+  <div class="app-root">
+    <div v-if="editorReady" class="editor-shell" :aria-hidden="libraryOpen">
+      <CanvasStage />
+      <TopBar @command="openCommand" @help="openHelp" @library="showLibrary" @toggle-sidebar="setSidebarOpen(!sidebarOpen)" />
+      <WorkspaceRail :active-tab="activeSidebarTab" :sidebar-open="sidebarOpen" @select="selectWorkspaceTab" @command="openCommand" @help="openHelp" />
+      <MarkdownPanel />
+      <Sidebar :open="sidebarOpen" :active-tab="activeSidebarTab" @update:active-tab="activeSidebarTab = $event" @help="openHelp" @close="setSidebarOpen(false)" />
+      <EditorOverlays />
     </div>
 
-    <div
-      v-if="helpOpen"
-      class="overlay-layer help-layer"
-      role="presentation"
-      @click.self="helpOpen = false"
-    >
-      <section class="help-dialog" role="dialog" aria-modal="true" aria-label="快捷键指南">
-        <header class="dialog-header">
-          <div>
-            <span class="dialog-label">WORKBENCH GUIDE</span>
-            <h2>让结构先于样式出现</h2>
-            <p>把节点当作词块，用空间和文字一起整理复杂想法。</p>
+    <DocumentLibrary
+      v-if="libraryOpen"
+      :documents="documents"
+      :trash="trash"
+      :current-id="currentDocumentId"
+      :storage-error="storageError"
+      @close="closeLibrary"
+      @open="openDocument"
+      @create="createNewDocument"
+      @duplicate="duplicate"
+      @trash="moveToTrash"
+      @restore="restore"
+      @export="exportBackup"
+      @import="importBackup"
+    />
+
+    <Teleport to="body">
+      <div v-if="commandOpen" class="overlay-layer command-layer" role="presentation" @click.self="closeCommand">
+        <section class="command-palette" role="dialog" aria-modal="true" aria-label="搜索操作">
+          <div class="command-search-row">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+            <input ref="commandInput" v-model="commandQuery" type="search" placeholder="搜索操作、视图或文件" aria-label="搜索操作、视图或文件" />
+            <kbd>Esc</kbd>
           </div>
-          <button class="dialog-close" type="button" aria-label="关闭快捷键指南" @click="helpOpen = false">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round">
-              <path d="M5 5l14 14M19 5 5 19" />
-            </svg>
-          </button>
-        </header>
-        <div class="help-content">
-          <section class="help-section">
-            <h3>构建结构</h3>
-            <div class="help-row"><kbd>Tab</kbd><span>添加子节点</span><small>从当前节点向外生长</small></div>
-            <div class="help-row"><kbd>Enter</kbd><span>添加同级节点</span><small>保持同一层级的节奏</small></div>
-            <div class="help-row"><kbd>F2</kbd><span>编辑节点</span><small>完成后按 Enter 提交</small></div>
-            <div class="help-row"><kbd>Del</kbd><span>删除节点</span><small>可用 Ctrl + Z 恢复</small></div>
-          </section>
-          <section class="help-section">
-            <h3>移动与聚焦</h3>
-            <div class="help-row"><kbd>Space</kbd><span>折叠 / 展开</span><small>按住并拖动则平移画布</small></div>
-            <div class="help-row"><kbd>F</kbd><span>适配视图</span><small>把当前结构放入可读范围</small></div>
-            <div class="help-row"><kbd>滚轮</kbd><span>缩放画布</span><small>以指针位置为中心缩放</small></div>
-            <div class="help-row"><kbd>Ctrl B</kbd><span>切换导航栏</span><small>为画布留出更多空间</small></div>
-          </section>
-          <section class="help-section help-section-wide">
-            <h3>工作流连线</h3>
-            <div class="help-row"><span class="help-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M4 12h16M16 7l5 5-5 5" /></svg></span><span>从节点右侧输出端口拖到目标输入端口</span><small>连接保持有向且不会形成循环</small></div>
-            <div class="help-row"><span class="help-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg></span><span>拖到空白处可直接创建并接入新节点</span><small>完成后输入名称即可</small></div>
-          </section>
-        </div>
-        <footer class="dialog-footer">
-          <span>当前主题与文档均保存在本机</span>
-          <button type="button" class="button-secondary" @click="helpOpen = false">知道了</button>
-        </footer>
-      </section>
-    </div>
-  </Teleport>
+          <div class="command-list" role="listbox" aria-label="操作列表">
+            <button v-for="(command, index) in filteredCommands" :key="command.id" type="button" class="command-item" :class="{ active: index === selectedCommandIndex }" role="option" :aria-selected="index === selectedCommandIndex" @mouseenter="selectedCommandIndex = index" @click="runCommand(command)">
+              <span class="command-copy"><strong>{{ command.label }}</strong><small>{{ command.description }}</small></span>
+              <span class="command-group">{{ command.group }}</span><kbd v-if="command.shortcut">{{ command.shortcut }}</kbd>
+            </button>
+            <div v-if="!filteredCommands.length" class="command-empty">没有找到对应操作。</div>
+          </div>
+        </section>
+      </div>
+
+      <div v-if="helpOpen" class="overlay-layer help-layer" role="presentation" @click.self="closeHelp">
+        <section class="help-dialog" role="dialog" aria-modal="true" aria-label="快捷键指南">
+          <header class="dialog-header"><div><h2>快捷键与画布操作</h2><p>高频编辑保持在键盘附近，高级关系按需出现。</p></div><button class="dialog-close" type="button" aria-label="关闭" @click="closeHelp">×</button></header>
+          <div class="help-content">
+            <section class="help-section"><h3>构建结构</h3><div class="help-row"><kbd>Tab</kbd><span>添加子节点</span></div><div class="help-row"><kbd>Enter</kbd><span>添加同级节点</span></div><div class="help-row"><kbd>F2</kbd><span>编辑节点</span></div><div class="help-row"><kbd>Del</kbd><span>删除节点</span></div></section>
+            <section class="help-section"><h3>移动与聚焦</h3><div class="help-row"><kbd>Space</kbd><span>折叠 / 展开</span></div><div class="help-row"><kbd>F</kbd><span>适配视图</span></div><div class="help-row"><kbd>Ctrl B</kbd><span>结构导航</span></div><div class="help-row"><kbd>Ctrl K</kbd><span>搜索操作</span></div></section>
+          </div>
+          <footer class="dialog-footer"><span>内容只保存在当前浏览器</span><button type="button" class="button-secondary" @click="closeHelp">知道了</button></footer>
+        </section>
+      </div>
+    </Teleport>
+  </div>
 </template>
